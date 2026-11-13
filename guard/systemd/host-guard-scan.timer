@@ -1,0 +1,10 @@
+[Unit]
+Description=host-guard: weekly scan (Trivy, Lynis)
+
+[Timer]
+OnCalendar=Sun 02:00
+RandomizedDelaySec=20min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

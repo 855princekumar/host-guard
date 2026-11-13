@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install pytest==8.4.2
+      - run: python -m pytest -q guard/tests panel/tests
+
+  shell:
+    name: Shell scripts
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          for f in guard/install.sh guard/conf/firewall.sh panel/install.sh; do bash -n "$f"; done
+          shellcheck -S error guard/install.sh guard/conf/firewall.sh panel/install.sh
+
+  units:
+    name: systemd units
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          sudo install -m 0755 guard/hostguard.py /usr/local/sbin/hostguard
+          sudo install -m 0755 guard/conf/firewall.sh /usr/local/sbin/host-guard-firewall
+          sudo install -D -m 0644 panel/hgpanel.py /usr/local/lib/host-guard-panel/hgpanel.py
+          getent passwd hgpanel || sudo useradd --system --no-create-home hgpanel
+          systemd-analyze verify guard/systemd/*.service panel/systemd/*.service
+          systemd-analyze security --offline=true --threshold=20 panel/systemd/host-guard-panel.service

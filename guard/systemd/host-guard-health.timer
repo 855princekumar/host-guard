@@ -1,0 +1,10 @@
+[Unit]
+Description=host-guard: health check
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=host-guard: weekly restore test
+
+[Timer]
+OnCalendar=Sun 04:30
+Persistent=true
+
+[Install]
+WantedBy=timers.target

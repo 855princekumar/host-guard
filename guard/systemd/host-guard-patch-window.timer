@@ -1,0 +1,9 @@
+[Unit]
+Description=host-guard: reboot for security updates in the maintenance window
+
+[Timer]
+OnCalendar=@MAINT@ @TZ@
+Persistent=true
+
+[Install]
+WantedBy=timers.target

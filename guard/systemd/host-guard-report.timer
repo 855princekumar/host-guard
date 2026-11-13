@@ -1,0 +1,9 @@
+[Unit]
+Description=host-guard: daily report
+
+[Timer]
+OnCalendar=*-*-* @REPORT@:00 @TZ@
+Persistent=true
+
+[Install]
+WantedBy=timers.target

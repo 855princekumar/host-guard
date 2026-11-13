@@ -1,0 +1,7 @@
+[Unit]
+Description=host-guard: status file for the panel (no secrets)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/hostguard export
+Nice=10

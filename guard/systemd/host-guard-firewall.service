@@ -1,0 +1,12 @@
+[Unit]
+Description=host-guard: firewall additions (after Docker made its chains)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/host-guard-firewall
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

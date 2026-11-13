@@ -1,0 +1,41 @@
+[Unit]
+Description=host-guard panel (127.0.0.1 only, one admin, read-only)
+After=network.target
+
+[Service]
+User=hgpanel
+Group=hgpanel
+ExecStart=/usr/bin/python3 -I /usr/local/lib/host-guard-panel/hgpanel.py serve
+Restart=on-failure
+RestartSec=5
+UMask=0077
+# The panel can write only its own folder (its SQLite file) and reads the exported status.
+ReadWritePaths=/var/lib/host-guard-panel
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+InaccessiblePaths=/etc/host-guard /var/lib/host-guard /var/backups/host-guard
+
+[Install]
+WantedBy=multi-user.target
