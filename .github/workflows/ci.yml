@@ -34,6 +34,15 @@ jobs:
       - run: pip install bandit==1.8.6
       - run: bandit -r guard panel -x guard/tests,panel/tests -ll
 
+  secrets:
+    name: Secret scan (gitleaks, full history)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - run: docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.24.0 git /repo --no-banner --redact -v
+
   shell:
     name: Shell scripts
     runs-on: ubuntu-24.04

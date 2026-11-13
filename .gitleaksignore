@@ -1,0 +1,2 @@
+# The public RFC 6238 test vector in the panel tests (not a secret)
+9488ac5ac6785c92235bc4e7f68ea8398ade2393:panel/tests/test_panel.py:generic-api-key:16

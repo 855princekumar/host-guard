@@ -13,7 +13,7 @@ import urllib.parse
 import pytest
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SECRET = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ'          # base32 of RFC 6238's "12345678901234567890"
+SECRET = 'GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ'          # base32 of RFC 6238's "12345678901234567890" gitleaks:allow
 
 
 @pytest.fixture
