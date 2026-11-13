@@ -16,6 +16,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       security-events: write
+      actions: read          # codeql-action v4 reads the workflow run
       contents: read
     strategy:
       matrix:
