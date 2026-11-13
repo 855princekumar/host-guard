@@ -55,8 +55,15 @@ Tailscale with `BIND` set to the tailnet address, `ALLOW_REMOTE=1` and
 5. Optional small local language model that explains findings and suggests an
    action. It never acts on its own: log text can carry instructions from an attacker.
 
-## Tests
+## Tests and checks
 
 ```bash
 python -m pytest -q guard/tests panel/tests
 ```
+
+CI also runs Bandit (security lint, medium and up), ShellCheck, `systemd-analyze
+verify` and the panel unit's sandbox score. The guard's `# nosec` lines are
+deliberate: `B602` is its own command runner (fixed commands; outside values such
+as mail addresses are validated and quoted), `B310` are URLs from constants or
+root's `guard.conf` (and the instance metadata address). GitHub code scanning
+(CodeQL) needs Advanced Security on a private repository; Bandit stands in.

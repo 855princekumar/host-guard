@@ -156,7 +156,7 @@ def save(data, name='state.json'):
 def sh(cmd, timeout=120, input=None):
     """Run a shell command; returns (exit code, stdout+stderr text). Never raises."""
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, input=input)
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, input=input)  # nosec B602
         return r.returncode, (r.stdout + r.stderr).strip()
     except subprocess.TimeoutExpired:
         return 124, f'timed out after {timeout}s: {cmd[:80]}'
@@ -268,7 +268,7 @@ def api(path_):
     req = urllib.request.Request(C['EDGESHELL_URL'].rstrip('/') + '/api/v1' + path_,
                                  headers={'Authorization': 'Bearer ' + C['EDGESHELL_KEY'], 'User-Agent': 'host-guard'})
     try:
-        with urllib.request.urlopen(req, timeout=20, context=ctx) as r:
+        with urllib.request.urlopen(req, timeout=20, context=ctx) as r:  # nosec B310
             return json.load(r)
     except Exception as e:
         return {'error': str(e)[:120]}
@@ -432,7 +432,7 @@ def new_bans(jails=None):
         lines = [f'{ip}: {WHY.get(j, j)} ({j})' for j, ips in fresh.items() for ip in ips]
         mail(f'Blocked {len(lines)} address(es)', '\n'.join(lines[:50]) +
              '\n\nUnban one: sudo fail2ban-client set <jail> unbanip <address>',
-             key='ban-' + hashlib.sha1(''.join(lines).encode()).hexdigest()[:8], level='alert')
+             key='ban-' + hashlib.sha1(''.join(lines).encode(), usedforsecurity=False).hexdigest()[:8], level='alert')
     return fresh
 
 
@@ -525,7 +525,7 @@ def watch():
         action = lockdown('; '.join(c.splitlines()[0] for c in critical))
         mail('Intrusion signs on the server', '\n\n'.join(critical + alerts) + '\n\n' + action, level='critical')
     elif alerts:
-        mail('Host security alert', '\n\n'.join(alerts), key='host-' + hashlib.sha1(''.join(alerts).encode()).hexdigest()[:10],
+        mail('Host security alert', '\n\n'.join(alerts), key='host-' + hashlib.sha1(''.join(alerts).encode(), usedforsecurity=False).hexdigest()[:10],
              level='alert')
     print(f'watch: {len(critical)} critical, {len(alerts)} alert(s)')
 
@@ -544,7 +544,7 @@ def get_json(url, data=None, timeout=60):
                                  headers={'User-Agent': 'host-guard', 'Accept': 'application/json',
                                           'Accept-Encoding': 'gzip',
                                           **({'Content-Type': 'application/json'} if data is not None else {})})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:  # nosec B310
         body = r.read()
     if body[:2] == b'\x1f\x8b':                 # AWS's price files come gzip-compressed, asked for or not
         body = gzip.decompress(body)
@@ -687,13 +687,13 @@ def aws_creds():
     if C['AWS_ACCESS_KEY_ID'] and C['AWS_SECRET_ACCESS_KEY']:
         return C['AWS_ACCESS_KEY_ID'], C['AWS_SECRET_ACCESS_KEY'], None
     try:                                                     # the instance role, through IMDSv2
-        tok = urllib.request.urlopen(urllib.request.Request(
+        tok = urllib.request.urlopen(urllib.request.Request(  # nosec B310
             'http://169.254.169.254/latest/api/token', method='PUT',
             headers={'X-aws-ec2-metadata-token-ttl-seconds': '300'}), timeout=3).read().decode()
         h = {'X-aws-ec2-metadata-token': tok}
         base = 'http://169.254.169.254/latest/meta-data/iam/security-credentials/'
-        role = urllib.request.urlopen(urllib.request.Request(base, headers=h), timeout=3).read().decode().split()[0]
-        c = json.load(urllib.request.urlopen(urllib.request.Request(base + role, headers=h), timeout=3))
+        role = urllib.request.urlopen(urllib.request.Request(base, headers=h), timeout=3).read().decode().split()[0]  # nosec B310
+        c = json.load(urllib.request.urlopen(urllib.request.Request(base + role, headers=h), timeout=3))  # nosec B310
         return c['AccessKeyId'], c['SecretAccessKey'], c['Token']
     except Exception:
         raise RuntimeError('no AWS credentials: give the instance a role, or set AWS_ACCESS_KEY_ID and '
@@ -728,7 +728,7 @@ def s3(method, key, body=b'', extra=None):
     req = urllib.request.Request(endpoint + uri + ('?' + query if query else ''), data=body if method in ('PUT', 'POST') else None,
                                  method=method, headers={k2: v for k2, v in headers.items() if k2 != 'host'})
     try:
-        with urllib.request.urlopen(req, timeout=300) as r:
+        with urllib.request.urlopen(req, timeout=300) as r:  # nosec B310
             return r.status, dict(r.headers), r.read()
     except urllib.error.HTTPError as e:
         return e.code, dict(e.headers), e.read()
@@ -938,10 +938,10 @@ def sample_usage():
 def imds(path_):
     """Instance metadata through IMDSv2; None off EC2."""
     try:
-        tok = urllib.request.urlopen(urllib.request.Request(
+        tok = urllib.request.urlopen(urllib.request.Request(  # nosec B310
             'http://169.254.169.254/latest/api/token', method='PUT',
             headers={'X-aws-ec2-metadata-token-ttl-seconds': '60'}), timeout=2).read().decode()
-        return urllib.request.urlopen(urllib.request.Request(
+        return urllib.request.urlopen(urllib.request.Request(  # nosec B310
             'http://169.254.169.254/latest/meta-data/' + path_, headers={'X-aws-ec2-metadata-token': tok}),
             timeout=2).read().decode().strip()
     except Exception:

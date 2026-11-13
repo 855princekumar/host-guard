@@ -23,6 +23,17 @@ jobs:
       - run: pip install pytest==8.4.2
       - run: python -m pytest -q guard/tests panel/tests
 
+  bandit:
+    name: Security lint (Bandit)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install bandit==1.8.6
+      - run: bandit -r guard panel -x guard/tests,panel/tests -ll
+
   shell:
     name: Shell scripts
     runs-on: ubuntu-24.04
