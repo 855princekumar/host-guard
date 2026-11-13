@@ -485,7 +485,7 @@ def watch():
             cmd = open(f'/proc/{pid}/cmdline', 'rb').read().replace(b'\0', b' ').decode(errors='replace')[:200]
         except OSError:
             continue
-        if MINER.search(comm) or MINER.search(os.path.basename(exe)) or exe.startswith(('/dev/shm/', '/run/shm/')):
+        if MINER.search(comm) or MINER.search(os.path.basename(exe)) or exe.startswith(('/dev/shm/', '/run/shm/')):  # nosec B108
             q = os.path.join(qdir, f'{pid}-{os.path.basename(exe).replace(" (deleted)", "")}')
             try:
                 shutil.copy(f'/proc/{pid}/exe', q)
