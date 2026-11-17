@@ -119,11 +119,14 @@ def test_the_daily_report_has_every_part(hg, monkeypatch):
     s['findings'] = [{'at': time.time(), 'text': 'New account that can log in: "eve"'}]
     hg.save(s)
     text = hg.report_text()
-    for part in ('== Memory', '== Containers', 'edgeshell      Up 3 days (healthy)', 'Version 1.19.0, nodes online 5 of 6',
+    for part in ('== Memory', '== Containers', 'edgeshell       Up 3 days (healthy)', 'Version 1.19.0, nodes online 5 of 6',
                  'Pi Nodes', 'Open alerts: 1 critical, 2 warning on 2 node(s)', '== Data lake', 'IO Yes',
                  'edgeshell-db-x.sql.gz.gpg (30 min ago, 2000 KB, S3: yes)', 'Host watch: 1 finding(s)', 'eve',
-                 '== Early warning', '== Updates', '== Last weekly scan'):
+                 '== Early warning', '== Updates', '== Last weekly scan', '== At a glance'):
         assert part in text, part
+    glance = text.split('== At a glance')[1].split('\n\n')[0]
+    assert 'Containers' in glance and 'EdgeShell' in glance and 'ATTENTION' in glance   # 1 critical node alert
+    assert 'Intrusion watch' in glance and '1 finding(s)' in glance
 
 
 def test_s3_requests_are_signed_like_aws(hg, monkeypatch):
@@ -264,6 +267,58 @@ def test_mail_goes_to_every_admin_and_nothing_reaches_the_shell(hg, tmp_path, mo
 def test_no_valid_recipient_sends_nothing(hg, monkeypatch):
     monkeypatch.setitem(hg.C, 'MAIL_TO', 'not-an-address, ;touch /tmp/x')
     assert hg.recipients() == [] and not hg.mail('Report', 'body') and mails(hg) == 0
+
+
+def test_replication_with_empty_fields_as_mariadb_prints_them(hg, monkeypatch):
+    # Production output: an empty Last_Error is followed by Skip_Counter, and an
+    # empty Master_SSL_Key by Seconds_Behind_Master. Empty must stay empty.
+    text = ('*************************** 1. row ***************************\n'
+            '                Slave_IO_State: Waiting for master to send event\n'
+            '              Slave_IO_Running: Yes\n'
+            '             Slave_SQL_Running: Yes\n'
+            '                    Last_Error: \n'
+            '                  Skip_Counter: 0\n'
+            '                Master_SSL_Key: \n'
+            '         Seconds_Behind_Master: 0\n'
+            '                Last_SQL_Error: \n')
+    monkeypatch.setattr(hg, 'compose', lambda args, timeout=120: (0, text))
+    assert hg.replication() == (True, 'IO Yes, SQL Yes, 0 s behind')
+
+
+def test_two_runs_saving_together_keep_both_results(hg):
+    # health and watch start at the same moment: both read, then each saves its own key
+    health_view, watch_view = hg.load(), None
+    watch_view = hg.load()
+    health_view['health'] = {'at': 1, 'problems': 0}
+    hg._LOADED['state.json'] = {}
+    hg.save(health_view)
+    hg._LOADED['state.json'] = {}
+    watch_view['watch'] = {'at': 2, 'alerts': 0}
+    hg.save(watch_view)
+    s = hg.load()
+    assert s['health'] == {'at': 1, 'problems': 0} and s['watch'] == {'at': 2, 'alerts': 0}
+    s.pop('watch')
+    hg.save(s)                                   # a key this run removed is removed
+    assert 'watch' not in hg.load() and 'health' in hg.load()
+
+
+def test_mails_are_html_with_a_text_fallback_and_escape_everything(hg):
+    import base64 as b64
+    body = ('Server: test-host\n\n== At a glance\n'
+            '  Backups           OK         last 1 h ago\n'
+            '  Intrusion watch   ATTENTION  1 finding(s)\n\n'
+            '== Findings\n  <script>alert(1)</script> in /tmp/x\n'
+            'Root disk used: 20%')
+    assert hg.mail('Daily report\nBcc: evil@example.com', body)          # a newline cannot add a header
+    raw = hg.SENT.read_text()
+    headers = raw.split('\n\n')[0]
+    assert raw.count('Subject: ') == 1 and '\nBcc:' not in headers
+    assert 'multipart/alternative' in raw and 'Content-Type: text/plain' in raw and 'Content-Type: text/html' in raw
+    assert 'Intrusion watch   ATTENTION' in raw                            # the plain text is there as it was
+    page = b64.b64decode(raw.split('Content-Transfer-Encoding: base64\n\n')[1].split('\n--')[0]).decode()
+    assert '<script>' not in page and '&lt;script&gt;alert(1)&lt;/script&gt;' in page
+    assert '<h3' in page and 'At a glance' in page and '<li' in page and '>Root disk used<' in page
+    assert 'ATTENTION</span>' in page and 'OK</span>' in page and 'For information' in page
 
 
 def test_export_has_the_status_and_no_secret(hg, tmp_path, monkeypatch):
