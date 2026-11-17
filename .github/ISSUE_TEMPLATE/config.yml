@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a vulnerability privately
+    url: https://github.com/855princekumar/host-guard/security/advisories/new
+    about: Please do not open a public issue for security problems.

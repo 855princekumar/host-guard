@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
-# host-guard installer for the EdgeShell server (Ubuntu 22.04, 24.04 or 26.04, Docker stack
-# in EDGESHELL_DIR). Idempotent: run it again after an update of this folder.
+# host-guard installer for one Ubuntu or Debian server (Ubuntu 22.04, 24.04, 26.04; Debian 12, 13):
+# a cloud instance, a VPS or bare metal. Idempotent: run it again after an update of this folder.
 #
 #   sudo bash install.sh --mail-to you@gmail.com[,admin2@example.com,...] --domain fleet.example.com \
 #        [--mail-from you@gmail.com]   (the Gmail account that sends; default: the first --mail-to)
-#        [--edgeshell-dir /home/ubuntu/edgeshell] [--login-user ubuntu] [--tz Asia/Kolkata]
+#        [--profile examples/profiles/NAME.conf] [--stack-dir /srv/app] [--web-logs /var/log/nginx]
+#        [--login-user ubuntu] [--tz Asia/Kolkata]
 #        [--report-time 09:00] [--maintenance "Sun 03:30"] [--s3-bucket NAME] [--with-trivy]
 #        [--smtp-file FILE] [--admin-ip ADDRESS] [--no-base-hardening] [--lockdown web|alert]
 #
-# First it runs EdgeShell's own docker/host-hardening.sh from the stack folder
-# (SSH by key only, fail2ban for SSH, repeat offenders, sign-in floods and
-# probes, banning in Docker's DOCKER-USER chain, log rotation, security
-# updates). host-guard adds what that does not: health, intrusion watch, early
-# warning, scans, encrypted backups with restore tests, the patch window, kernel
-# network hardening, outbound mining ports blocked, and mail for all of it.
+# First it runs conf/base-hardening.sh (SSH by key only, fail2ban for SSH and repeat
+# offenders, and with --web-logs for sign-in floods and probes, security updates);
+# a host-hardening.sh in --stack-dir (EdgeShell ships one) is used instead when present.
+# Then health, intrusion watch, early warning, scans, encrypted backups with restore
+# tests, the patch window, kernel network hardening, outbound mining ports blocked,
+# and mail for all of it. What the app on the server looks like (Docker Compose
+# folder, database, backup command) is in guard.conf: start from a --profile.
 #
 # Every secret lives in one file, /etc/host-guard/.env (root only, mode 600):
 #   SMTP_PASSWORD      the Gmail app password, asked for interactively (not echoed)
@@ -28,7 +30,7 @@ set -euo pipefail
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo)"; exit 1; }
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-MAIL_TO="" MAIL_FROM="" DOMAIN="" ES_DIR="/home/ubuntu/edgeshell" LOGIN_USER="ubuntu" TZ_="Asia/Kolkata" REPORT="09:00"
+MAIL_TO="" MAIL_FROM="" DOMAIN="" ES_DIR="" PROFILE="" WEB_LOGS="" LOGIN_USER="${SUDO_USER:-ubuntu}" TZ_="Asia/Kolkata" REPORT="09:00"
 MAINT="Sun 03:30" S3_BUCKET="" WITH_TRIVY=0 SMTP_FILE="" BASE_HARDEN=1 ADMIN_IP="" LOCKDOWN="alert"
 SMTP_HOST="smtp.gmail.com" SMTP_PORT=587 SMTP_PLAIN=0 S3_ENDPOINT="" AWS_REGION="ap-south-1"
 while [ $# -gt 0 ]; do
@@ -36,7 +38,9 @@ while [ $# -gt 0 ]; do
     --mail-to) MAIL_TO="$2"; shift 2;;
     --mail-from) MAIL_FROM="$2"; shift 2;;
     --domain) DOMAIN="$2"; shift 2;;
-    --edgeshell-dir) ES_DIR="$2"; shift 2;;
+    --stack-dir|--edgeshell-dir) ES_DIR="$2"; shift 2;;
+    --profile) PROFILE="$2"; shift 2;;
+    --web-logs) WEB_LOGS="$2"; shift 2;;
     --login-user) LOGIN_USER="$2"; shift 2;;
     --tz) TZ_="$2"; shift 2;;
     --report-time) REPORT="$2"; shift 2;;
@@ -63,6 +67,8 @@ for a in "${RCPTS[@]}"; do [[ "$a" =~ $EMAIL_RE ]] || { echo "--mail-to: '$a' is
 [ -n "$MAIL_FROM" ] || MAIL_FROM="${RCPTS[0]}"
 [[ "$MAIL_FROM" =~ $EMAIL_RE ]] || { echo "--mail-from is not an email address"; exit 2; }
 [[ "$LOCKDOWN" =~ ^(alert|web)$ ]] || { echo "--lockdown is alert or web"; exit 2; }
+[ -z "$PROFILE" ] || [ -f "$PROFILE" ] || { echo "--profile: $PROFILE not found (see examples/profiles/)"; exit 2; }
+for d in "$ES_DIR" "$WEB_LOGS"; do [[ "$d" =~ ^(/[A-Za-z0-9._/-]*)?$ ]] || { echo "'$d' is not an absolute path"; exit 2; }; done
 step() { printf '\n==> %s\n' "$*"; }
 
 step "Packages"
@@ -154,7 +160,7 @@ MAIL_TO=$MAIL_TO
 MAIL_FROM=$MAIL_FROM
 SITE=$(hostname)
 DOMAIN=$DOMAIN
-EDGESHELL_DIR=$ES_DIR
+STACK_DIR=$ES_DIR
 LOGIN_USER=$LOGIN_USER
 LOCKDOWN=$LOCKDOWN
 S3_BUCKET=$S3_BUCKET
@@ -163,6 +169,10 @@ AWS_REGION=$AWS_REGION
 # Running cost: the instance type and disk are read from the instance; set them only off EC2.
 # USD_INR=88 adds rupees to the report.
 EOF
+  if [ -n "$PROFILE" ]; then   # the app's settings; secrets in a profile are left out (they belong in .env)
+    printf '\n# From %s\n' "$(basename "$PROFILE")" >> "$CONF"
+    grep -E '^[A-Z][A-Z0-9_]*=' "$PROFILE" | grep -vE '^(SMTP_PASSWORD|BACKUP_PASSPHRASE|EDGESHELL_KEY|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|MAIL_TO|MAIL_FROM|DOMAIN|STACK_DIR)=' >> "$CONF" || true
+  fi
   umask 022
 else   # a rerun takes the recipients given now (both values were checked above)
   for k in MAIL_TO MAIL_FROM; do
@@ -176,17 +186,15 @@ step "Kernel and network hardening (sysctl)"
 install -m 0644 "$HERE/conf/sysctl-hardening.conf" /etc/sysctl.d/99-host-guard.conf
 sysctl --system >/dev/null 2>&1 || true
 
-step "Base hardening: EdgeShell's host-hardening.sh (SSH, fail2ban, log rotation, updates)"
+step "Base hardening (SSH, fail2ban, security updates)"
 if [ "$BASE_HARDEN" = 1 ]; then
-  BASE="$ES_DIR/host-hardening.sh"
-  [ -f "$BASE" ] || BASE="$HERE/../edgeshell/docker/host-hardening.sh"
-  if [ -f "$BASE" ]; then
-    # it reads SUDO_USER for the one user allowed to log in over SSH
-    SUDO_USER="$LOGIN_USER" bash "$BASE" ${ADMIN_IP:+--admin-ip "$ADMIN_IP"}
+  if [ -n "$ES_DIR" ] && [ -f "$ES_DIR/host-hardening.sh" ]; then
+    echo "  using $ES_DIR/host-hardening.sh (the app's own)"
+    SUDO_USER="$LOGIN_USER" bash "$ES_DIR/host-hardening.sh" ${ADMIN_IP:+--admin-ip "$ADMIN_IP"}
   else
-    echo "  $ES_DIR/host-hardening.sh not found: copy docker/host-hardening.sh from the EdgeShell release"
-    echo "  into $ES_DIR and run this again (or pass --no-base-hardening)"
-    exit 1
+    DOCKER_FLAG=""; [ -n "$ES_DIR" ] && DOCKER_FLAG="--docker"
+    bash "$HERE/conf/base-hardening.sh" --user "$LOGIN_USER" ${ADMIN_IP:+--admin-ip "$ADMIN_IP"} \
+      ${WEB_LOGS:+--web-logs "$WEB_LOGS"} $DOCKER_FLAG
   fi
 fi
 
@@ -195,7 +203,9 @@ install -m 0644 "$HERE/conf/52host-guard-unattended" /etc/apt/apt.conf.d/52host-
 printf 'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\n' > /etc/apt/apt.conf.d/20auto-upgrades
 
 step "Docker log rotation"
-if [ ! -s /etc/docker/daemon.json ]; then
+if ! command -v docker >/dev/null; then
+  echo "  no Docker on this server: skipped"
+elif [ ! -s /etc/docker/daemon.json ]; then
   install -d /etc/docker
   printf '{\n  "log-driver": "json-file",\n  "log-opts": {"max-size": "20m", "max-file": "5"}\n}\n' > /etc/docker/daemon.json
   echo "  set (applies to containers created from now on; restart Docker in a quiet moment)"

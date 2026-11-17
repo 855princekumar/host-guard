@@ -1,69 +1,152 @@
-# host-guard
+<div align="center">
 
-Security, health and early warning for one Linux server (cloud instance, VPS or
-bare metal), plus a small web panel for its single admin. Python 3 standard
-library, systemd timers, one SQLite file. No agents, no external services needed.
+<img src="docs/assets/banner.svg" alt="host-guard: one Linux server watched, patched, backed up and proven restorable. Python standard library and systemd, no agent, no bill." width="100%">
 
-| Part | What it is | Runs as |
-|---|---|---|
-| [guard/](guard/) | Health checks, intrusion watch, early warning feeds, weekly scans, encrypted backups with restore tests, patch window, running cost, mail to every admin | root, systemd timers |
-| [panel/](panel/) | One page with the status the guard exports, for one admin with password and authenticator code | `hgpanel` (unprivileged), 127.0.0.1 only |
+<a href="docs/assets/host-guard-intro.mp4" title="Watch the 42-second intro with sound (MP4)"><img src="docs/assets/host-guard-intro.webp" alt="host-guard in 42 seconds: health and intrusion watch every 5 minutes, encrypted backups with restore tests, early warning, the patch window and a one-command install" width="100%"></a>
 
-## Install
+<sub>host-guard in 42 seconds. <a href="docs/assets/host-guard-intro.mp4">Watch with sound (MP4)</a></sub>
+
+**Security, health, backups and early warning for one Linux server.**<br>
+For anyone running a product on a single cloud instance, VPS or bare-metal box without a platform team.
+
+[![CI](https://github.com/855princekumar/host-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/855princekumar/host-guard/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.2.0-blue)](CHANGELOG.md)
+[![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](CONTRIBUTING.md)
+
+[![Python](https://img.shields.io/badge/python-3.10%2B%2C%20standard%20library%20only-3776AB?logo=python&logoColor=white)](guard/hostguard.py)
+[![systemd](https://img.shields.io/badge/runs%20on-systemd%20timers-30D475?logo=linux&logoColor=white)](guard/systemd/)
+[![Ubuntu | Debian](https://img.shields.io/badge/OS-Ubuntu%2022.04%20to%2026.04%20%7C%20Debian%2012-E95420?logo=ubuntu&logoColor=white)](docs/INSTALL.md)
+[![Anywhere](https://img.shields.io/badge/hosts-EC2%20%7C%20any%20VPS%20%7C%20bare%20metal-0f172a)](docs/INSTALL.md)
+
+[![Bandit](https://img.shields.io/badge/security%20lint-Bandit-yellow)](.github/workflows/ci.yml)
+[![gitleaks](https://img.shields.io/badge/secret%20scan-gitleaks-blueviolet)](.github/workflows/ci.yml)
+[![Fresh installs tested](https://img.shields.io/badge/fresh%20install-tested%20in%20CI-success)](ci/fresh_install.sh)
+[![No agent](https://img.shields.io/badge/agent-none-lightgrey)](#why-host-guard)
+
+[Install](docs/INSTALL.md) · [How it works](docs/HOW-IT-WORKS.md) · [Configuration](docs/CONFIGURATION.md) · [Running cost](docs/COST.md) · [Panel](docs/PANEL.md) · [Security](SECURITY.md)
+
+</div>
+
+## Why host-guard
+
+Small products often run on one server. Nobody watches it at night, backups are
+"probably fine", and security updates wait until something breaks. Monitoring
+suites and security agents cost money, need their own servers, and send data
+somewhere else.
+
+host-guard is one Python file (standard library only) and a few systemd timers.
+It installs with one command, keeps every secret in one root-only file on the
+server, and mails every admin when a person is needed. Nothing leaves the server
+except the mail and, if you want, an encrypted backup copy in S3.
+
+<img src="docs/assets/how-it-works.svg" alt="How host-guard works: systemd timers start the jobs; health and intrusion watch every 5 minutes, early warning every 6 hours, a nightly encrypted backup, a weekly scan, restore test and patch window; results go to every admin's inbox and to an optional local panel" width="100%">
+
+## What it does
+
+| Job | How often | What it checks or does | When something is wrong |
+|---|---|---|---|
+| Health | every 5 min | disk, memory, containers, HTTPS answer, TLS certificate, database replication, backup age, pending reboot, new bans | one alert, then a "resolved" mail |
+| Intrusion watch | every 5 min | extra root accounts, new login accounts and SSH keys, changed sudo, SSH, cron and systemd files, rootkit preload, crypto miners, programs in memory-only folders, root SSH from the internet | critical mail at once; extra root accounts locked, miners killed (a copy kept); optional lockdown of the web server |
+| Early warning | every 6 h | CISA's exploited vulnerabilities, Ubuntu security notices, OSV advisories for the Python packages in your containers, matched to what runs here | mail with the advisory and the fixed version |
+| Backup | nightly | your database (MariaDB or PostgreSQL) or any command's output, gzipped, encrypted with AES-256, checksummed, newest 3 kept, optional S3 copy | alert if the dump, encryption or upload fails |
+| Restore test | weekly | the newest backup decrypted and loaded into a throwaway database (or unpacked completely) | alert: a backup that does not restore is no backup |
+| Scan | weekly | Trivy on every running image, Lynis on the host | mail with what to fix |
+| Patch window | weekly | security updates install daily; the reboot they need happens here, after a fresh backup and only with healthy replication | reboot postponed, with the reason |
+| Daily report | daily | at a glance (OK or ATTENTION per area), what needs a person, every detail, the running cost and where it could cost less | problems listed first |
+
+On install it also hardens the base: SSH by key only for one user, fail2ban for
+SSH and repeat offenders (and for sign-in floods and probes when you give it the
+web logs), kernel network settings, outbound mining ports blocked, automatic
+security updates.
+
+## Quick start
+
+On the server (Ubuntu 22.04 to 26.04 or Debian 12), with an SSH key that works and a
+second session open:
 
 ```bash
-sudo bash guard/install.sh --mail-to you@gmail.com,admin2@example.com --domain your.domain ...
-sudo bash panel/install.sh
-sudo -u hgpanel python3 /usr/local/lib/host-guard-panel/hgpanel.py init-admin <name>
+git clone https://github.com/855princekumar/host-guard.git && cd host-guard
+sudo bash guard/install.sh --mail-to you@gmail.com,teammate@example.com \
+     --profile examples/profiles/plain-vps.conf --with-trivy
 ```
 
-Open the panel through a tunnel from your computer:
-`ssh -L 8650:127.0.0.1:8650 <server>`, then http://127.0.0.1:8650 (or over
-Tailscale with `BIND` set to the tailnet address, `ALLOW_REMOTE=1` and
-`ALLOWED_HOSTS`). See [guard/README.md](guard/README.md) for every guard option.
+It asks for the Gmail app password of the first address (not shown as you type),
+then sends a test mail. Copy the backup passphrase somewhere offline:
+`sudo grep BACKUP_PASSPHRASE /etc/host-guard/.env`.
 
-## Security model of the panel
+Pick the profile closest to your server, or start from `plain-vps.conf` and edit
+`/etc/host-guard/guard.conf` later:
 
-- **Not on the internet.** Listens on 127.0.0.1 by default; any other address is
-  refused unless set on purpose. The Host header is checked (no DNS rebinding).
-- **No privilege.** Runs as `hgpanel` under a locked-down systemd unit (read-only
-  system, no capabilities, syscall filter). It cannot read the guard's state,
-  `.env` or backups. Root writes a status file without secrets
-  (`hostguard export`, every minute) into a folder the panel can read but not write.
-- **One admin.** The table holds one row. Password hashed with scrypt; second
-  factor TOTP (any authenticator app) with replay protection. Five failures lock
-  the account for 15 minutes; ten failures from one address block that address.
-  The message never says which part was wrong.
-- **Sessions.** 256-bit random token, only its SHA-256 stored; cookie HttpOnly,
-  SameSite=Strict, Secure; 15 minutes idle, 8 hours at most; new token at every
-  sign-in.
-- **Web.** CSRF token on every form, parameterized SQL only, every value
-  HTML-escaped, a Content-Security-Policy that allows no script at all, no
-  framing, `no-store` caching, 8 KB request limit. Every sign-in, failure,
-  lockout and sign-out is in the audit log (`/audit`, or `hgpanel audit`).
+| Profile | For |
+|---|---|
+| [plain-vps.conf](examples/profiles/plain-vps.conf) | any VPS or bare-metal box; backs up `/etc` and `/home` |
+| [compose-postgres.conf](examples/profiles/compose-postgres.conf) | a Docker Compose app with PostgreSQL |
+| [bare-metal-mariadb.conf](examples/profiles/bare-metal-mariadb.conf) | nginx and MariaDB installed on the host |
+| [edgeshell.conf](examples/profiles/edgeshell.conf) | [EdgeShell](https://github.com/855princekumar/edgeshell): Compose, MariaDB primary and replica |
 
-## Roadmap
+Full steps for EC2, a VPS and bare metal, other mail providers and an off-site
+S3 copy: [docs/INSTALL.md](docs/INSTALL.md).
 
-1. **Now:** read-only panel (this version).
-2. Settings from the panel: recipients, thresholds, schedule. Secrets only
-   write-only (replace, never shown), through a root helper that accepts a fixed
-   list of actions and validates every value.
-3. Quick actions through the same helper: test mail, backup now, restore test,
-   unban an address, end a lockdown. Each one confirmed with a fresh code and audited.
-4. Anomaly detection by statistics on the guard's own numbers (sign-in failures,
-   traffic, CPU, new processes), with baselines per hour of the week.
-5. Optional small local language model that explains findings and suggests an
-   action. It never acts on its own: log text can carry instructions from an attacker.
+## How it fits together
 
-## Tests and checks
+```mermaid
+flowchart LR
+    T["systemd timers"] --> H["hostguard health / watch / feeds"]
+    T --> B["hostguard backup"]
+    T --> R["hostguard restore-test"]
+    T --> P["hostguard patch-window"]
+    T --> D["hostguard report"]
+    H --> S[("state in /var/lib/host-guard")]
+    B --> K["encrypted file, AES-256"]
+    K --> L["local, newest 3"]
+    K -. optional .-> S3["S3 with Object Lock"]
+    R --> K
+    H --> M["msmtp"]
+    D --> M
+    M --> A["every admin's inbox"]
+    S --> E["hostguard export: status without secrets"]
+    E --> UI["panel, 127.0.0.1 only"]
+```
+
+More diagrams (the life of an alert, a night's backup, the weekly rhythm, the
+panel's security split): [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
+
+## The panel (optional)
+
+A one-page, read-only view of the same status for one admin: password hashed
+with scrypt plus an authenticator code, 127.0.0.1 only (reach it through
+`ssh -L`), running as an unprivileged user that cannot read any secret.
+[docs/PANEL.md](docs/PANEL.md).
+
+## Everyday commands
+
+| Task | Command |
+|---|---|
+| Status and open problems | `sudo hostguard status` |
+| The daily report now | `sudo hostguard report` |
+| Check that mail reaches everyone | `sudo hostguard test-mail` |
+| When each job runs next | `systemctl list-timers 'host-guard-*'` |
+| Back up now / restore test now | `sudo systemctl start host-guard-backup` / `host-guard-restore-test` |
+| Unban an address | `sudo fail2ban-client set <jail> unbanip <address>` |
+| End a web lockdown | `sudo hostguard unlock` |
+
+## Tests
 
 ```bash
 python -m pytest -q guard/tests panel/tests
+docker run --rm -v "$PWD:/src:ro" ubuntu:26.04 bash /src/ci/fresh_install.sh
 ```
 
-CI also runs Bandit (security lint, medium and up), ShellCheck, `systemd-analyze
-verify` and the panel unit's sandbox score. The guard's `# nosec` lines are
-deliberate: `B602` is its own command runner (fixed commands; outside values such
-as mail addresses are validated and quoted), `B310` are URLs from constants or
-root's `guard.conf` (and the instance metadata address), `B108` is the miner check looking for programs run from `/dev/shm`. GitHub code scanning
-(CodeQL) needs Advanced Security on a private repository; Bandit stands in.
+CI runs the tests on Python 3.12 and 3.14, a fresh install on Ubuntu 24.04, 26.04
+and Debian 12 (with a real `sshd -t`, a backup and a restore test), Bandit,
+gitleaks over the whole history, ShellCheck, `systemd-analyze verify`, a check for
+broken links in the docs and one for the em dash character.
+
+## Contributing and security
+
+Issues and pull requests are welcome: [CONTRIBUTING.md](CONTRIBUTING.md).
+Please report vulnerabilities privately: [SECURITY.md](SECURITY.md).
+
+MIT licensed. Built by [Prince Kumar](https://github.com/855princekumar), first
+for the server that runs [EdgeShell](https://github.com/855princekumar/edgeshell).

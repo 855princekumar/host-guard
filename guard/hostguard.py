@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""host-guard: security, health and early warning for the server that runs the
-EdgeShell stack (an EC2 with Docker). Python 3 standard library only.
+"""host-guard: security, health and early warning for one Linux server (a cloud
+instance, a VPS or bare metal), with or without a Docker Compose app on it.
+Python 3 standard library only. Every app-specific part is a setting that is off
+when empty (docs/CONFIGURATION.md); examples/profiles/ has ready combinations.
 
     hostguard health         every 5 min: disk, memory, containers, HTTPS, certificate,
                              data lake replication, backups, pending reboot, new fail2ban
@@ -11,24 +13,25 @@ EdgeShell stack (an EC2 with Docker). Python 3 standard library only.
     hostguard feeds          every 6 h: trusted sources (CISA KEV, Ubuntu notices, OSV for the
                              Python packages inside the running containers) -> early warning
     hostguard scan           weekly: Trivy on every running image, Lynis on the host
-    hostguard backup         nightly: both databases dumped, encrypted (gpg AES-256), kept
-                             locally and uploaded to S3 with a SHA-256 checksum
-    hostguard restore-test   weekly: the newest backup from S3, decrypted and loaded into a
-                             throwaway MariaDB; table and row counts reported
+    hostguard backup         nightly: the database (MariaDB or PostgreSQL) or BACKUP_CMD's
+                             output, encrypted (gpg AES-256), kept locally and optionally
+                             uploaded to S3 with a SHA-256 checksum
+    hostguard restore-test   weekly: the newest backup decrypted and loaded into a throwaway
+                             database (or, for BACKUP_CMD output, decrypted and unpacked)
     hostguard patch-window   in the maintenance window: reboot for security updates only
                              after a fresh backup and with replication healthy
     hostguard cost           what the server costs to run, from AWS's published prices and
                              the measured usage: per day and month, per service, per managed
                              node, and where it could be cheaper (Graviton, smaller, Lightsail)
-    hostguard report         daily: one mail with everything above and EdgeShell's fleet
+    hostguard report         daily: one mail with everything above (and EdgeShell's fleet, if used)
     hostguard boot           after every boot: a mail, with the health check
     hostguard export         every minute (with the panel): a status file without secrets
                              for the web panel, which runs unprivileged
     hostguard test-mail | status | unlock
 
-Bans (SSH, repeat offenders, sign-in floods, probes) are fail2ban's, set up by
-EdgeShell's docker/host-hardening.sh, which install.sh runs first; host-guard
-reports them. Unban: sudo fail2ban-client set <jail> unbanip <address>.
+Bans (SSH, repeat offenders, and with web logs sign-in floods and probes) are
+fail2ban's, set up by conf/base-hardening.sh, which install.sh runs first;
+host-guard reports them. Unban: sudo fail2ban-client set <jail> unbanip <address>.
 
 Settings: /etc/host-guard/guard.conf (KEY=VALUE, no secrets). Secrets live
 only in /etc/host-guard/.env (root only): SMTP_PASSWORD (the Gmail app
@@ -58,21 +61,25 @@ import urllib.request
 CONF = os.environ.get('HOSTGUARD_CONF', '/etc/host-guard/guard.conf')
 DEFAULTS = {
     'MAIL_TO': '', 'MAIL_FROM': '', 'SITE': socket.gethostname(), 'DOMAIN': '',
-    'EDGESHELL_DIR': '/home/ubuntu/edgeshell', 'EDGESHELL_URL': '', 'EDGESHELL_KEY': '',
+    # the app on this server: all optional, off when empty (docs/CONFIGURATION.md)
+    'APP_NAME': 'the website', 'STACK_DIR': '', 'HEALTH_PATH': '/', 'WEB_SERVICE': 'nginx',
+    'DB_ENGINE': 'none', 'DB_SERVICE': '', 'DB_REPLICA': '', 'BACKUP_CMD': '', 'BACKUP_PREFIX': 'backup',
+    'MARIADB_IMAGE': 'mariadb:11.4', 'PG_IMAGE': 'postgres:17', 'PG_USER': 'postgres', 'BACKUP_MIN_BYTES': '1024',
+    'EDGESHELL_DIR': '', 'EDGESHELL_URL': '', 'EDGESHELL_KEY': '',
     'STATE_DIR': '/var/lib/host-guard', 'NOTIFY_CMD': 'msmtp -a default',
     'EXPORT_FILE': '/var/lib/host-guard-export/status.json', 'EXPORT_GROUP': 'hgpanel',
     'DISK_WARN': '85', 'MEM_FREE_MIN': '10', 'CERT_DAYS': '14', 'LAG_WARN': '300', 'COOLDOWN_H': '6',
     'BACKUP_DIR': '/var/backups/host-guard', 'BACKUP_KEEP': '3', 'BACKUP_PASSPHRASE': '',
     'ENV_FILE': '/etc/host-guard/.env',
-    'BACKUP_MAX_AGE_H': '26', 'S3_BUCKET': '', 'S3_PREFIX': 'edgeshell-db/', 'S3_ENDPOINT': '', 'AWS_REGION': 'ap-south-1',
+    'BACKUP_MAX_AGE_H': '26', 'S3_BUCKET': '', 'S3_PREFIX': 'host-guard/', 'S3_ENDPOINT': '', 'AWS_REGION': 'ap-south-1',
     'AWS_ACCESS_KEY_ID': '', 'AWS_SECRET_ACCESS_KEY': '',
-    'JAILS': 'sshd recidive nginx-limit-req edgeshell-probe',
+    'JAILS': 'sshd recidive nginx-limit-req web-probe edgeshell-probe',
     'LOCKDOWN': 'alert',            # alert | web (stop nginx on a critical intrusion sign)
     'LOGIN_USER': 'ubuntu', 'LYNIS_MIN': '65',
     'KEV_URL': 'https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json',
     'USN_URL': 'https://ubuntu.com/security/notices.json?limit=30',
     'OSV_URL': 'https://api.osv.dev/v1/querybatch', 'OSV_VULN_URL': 'https://api.osv.dev/v1/vulns/',
-    'CONTAINERS_PYTHON': 'edgeshell sensehive',
+    'CONTAINERS_PYTHON': '',
     # running cost: AWS's public price files (no credentials); the PRICE_* values are used
     # when they cannot be read. Mumbai list prices of 2026-11-10.
     'PRICES_URL': 'https://b0.p.awsstatic.com/pricing/2.0/meteredUnitMaps',
@@ -125,8 +132,11 @@ def conf():
     for k in SECRETS:
         if secrets.get(k) and not os.environ.get('HG_' + k):
             c[k] = secrets[k]
-    if not c['EDGESHELL_URL'] and c['DOMAIN']:
+    if not c['STACK_DIR'] and c['EDGESHELL_DIR']:          # the setting's name before 0.2
+        c['STACK_DIR'] = c['EDGESHELL_DIR']
+    if not c['EDGESHELL_URL'] and c['DOMAIN'] and c['EDGESHELL_KEY']:
         c['EDGESHELL_URL'] = 'https://' + c['DOMAIN']
+    c['SITE_URL'] = 'https://' + c['DOMAIN'] if c['DOMAIN'] else ''
     return c
 
 
@@ -320,7 +330,7 @@ def mail(subject, body, key=None, level='info'):
     to = ', '.join(rcpts)
     frm = C['MAIL_FROM'] or (rcpts[0] if rcpts else '')
     subject = re.sub(r'[\r\n]+', ' ', subject)                     # never a second header
-    footer = f'host-guard on {C["SITE"]}{" | " + C["EDGESHELL_URL"] if C["EDGESHELL_URL"] else ""} | {stamp()}'
+    footer = f'host-guard on {C["SITE"]}{" | " + C["SITE_URL"] if C["SITE_URL"] else ""} | {stamp()}'
     text = '\n'.join(line[:900] for line in f'{body}\n\n-- \n{footer}\n'.splitlines()) + '\n'
     page = base64.encodebytes(mail_html(subject, body, level, footer).encode()).decode()
     bnd = 'hg-' + hashlib.sha256(f'{now()}{subject}'.encode()).hexdigest()[:24]
@@ -351,13 +361,15 @@ def resolved(key, subject, body=''):
         mail(subject, body or 'Back to normal.', level='resolved')
 
 
-# ---------------------------------------------------------------- Docker and the EdgeShell stack
+# ---------------------------------------------------------------- the Docker Compose app (optional)
 def compose(args, timeout=120):
-    return sh(f'docker compose --project-directory {C["EDGESHELL_DIR"]} {args}', timeout)
+    if not C['STACK_DIR']:
+        return 1, 'no STACK_DIR set'
+    return sh(f'docker compose --project-directory {shlex.quote(C["STACK_DIR"])} {args}', timeout)
 
 
 def containers():
-    """[{name, service, state, health, status}] of the EdgeShell stack."""
+    """[{name, service, state, health, status}] of the Compose app (none without STACK_DIR)."""
     rc, text = compose('ps -a --format json')
     rows = []
     if rc != 0:
@@ -395,9 +407,12 @@ def api(path_):
 
 
 def replication():
-    """The data lake replica's state: (ok, text)."""
-    rc, text = compose("exec -T mariadb-lake sh -c 'mariadb -uroot -p\"$MARIADB_ROOT_PASSWORD\" -e \"SHOW REPLICA STATUS\\G\"'",
-                       timeout=30)
+    """The database replica's state: (ok, text); (None, why) when there is none to check.
+    DB_REPLICA is the replica's Compose service (MariaDB or MySQL)."""
+    if not C['DB_REPLICA']:
+        return None, 'not configured'
+    rc, text = compose(f"exec -T {shlex.quote(C['DB_REPLICA'])} sh -c 'mariadb -uroot -p\"$MARIADB_ROOT_PASSWORD\" "
+                       f"-e \"SHOW REPLICA STATUS\\G\"'", timeout=30)
     if rc != 0:
         return None, 'replica not reachable: ' + text.splitlines()[-1][:120] if text else 'replica not reachable'
     f = dict(re.findall(r'^[ \t]*(\w+):[ \t]*(.*)$', text, re.M))     # an empty value stays empty
@@ -441,7 +456,7 @@ def cert_days():
 def https_code():
     target = C['DOMAIN'] or 'localhost'
     rc, text = sh(f'curl -sk -o /dev/null -w "%{{http_code}}" --max-time 20 --resolve {target}:443:127.0.0.1 '
-                  f'https://{target}/healthz', 30)
+                  + shlex.quote(f'https://{target}{C["HEALTH_PATH"]}'), 30)
     return text.strip()[-3:] if rc == 0 else '000'
 
 
@@ -455,25 +470,28 @@ def checks():
     res.append(('disk', d >= int(C['DISK_WARN']), f'Disk {d}% full',
                 out('df -h /') + '\n\nDocker:\n' + out('docker system df') +
                 '\n\nFree space: sudo docker image prune -af (old images); check data/ and backups.'))
-    rows = containers()
-    bad = [r for r in rows if r['service'] not in ONE_SHOT and (r['state'] != 'running' or r['health'] == 'unhealthy')]
-    if rows:
-        res.append(('containers', bool(bad), 'Container down: ' + ', '.join(r['service'] for r in bad),
-                    '\n'.join(f'{r["service"]:<14} {r["status"]}' for r in rows)))
-    else:
-        res.append(('containers', True, 'The EdgeShell stack is not running', compose('ps -a')[1][:2000]))
-    code = https_code()
-    res.append(('https', code != '200', f'EdgeShell not answering (HTTP {code})',
-                f'https://{C["DOMAIN"] or "localhost"}/healthz answered {code} from the server itself.'))
+    if C['STACK_DIR']:
+        rows = containers()
+        bad = [r for r in rows if r['service'] not in ONE_SHOT and (r['state'] != 'running' or r['health'] == 'unhealthy')]
+        if rows:
+            res.append(('containers', bool(bad), 'Container down: ' + ', '.join(r['service'] for r in bad),
+                        '\n'.join(f'{r["service"]:<14} {r["status"]}' for r in rows)))
+        else:
+            res.append(('containers', True, f'{C["APP_NAME"]}: no container running', compose('ps -a')[1][:2000]))
+    if C['DOMAIN']:
+        code = https_code()
+        res.append(('https', not code.startswith(('2', '3')), f'{C["APP_NAME"]} not answering (HTTP {code})',
+                    f'https://{C["DOMAIN"]}{C["HEALTH_PATH"]} answered {code} from the server itself.'))
     days = cert_days()
     if days is not None:
         res.append(('cert', days < int(C['CERT_DAYS']), f'TLS certificate expires in {days} days',
-                    'certbot renews it about 30 days before expiry; check: docker compose logs certbot'))
+                    'certbot renews it about 30 days before expiry; check its logs (docker compose logs certbot, '
+                    'or journalctl -u certbot).'))
     ok, detail = replication()
     if ok is not None:
-        res.append(('replication', not ok, 'Data lake replication: ' + detail,
-                    'The lake keeps every metric; while it is behind, hot retention purges wait.'))
-    if C['S3_BUCKET']:
+        res.append(('replication', not ok, 'Database replication: ' + detail,
+                    'The replica is behind or stopped: check it before relying on it.'))
+    if backup_configured():
         last = load().get('backup', {}).get('at', 0)
         age = (now() - last) / 3600 if last else None
         res.append(('backup', age is None or age > float(C['BACKUP_MAX_AGE_H']),
@@ -496,8 +514,8 @@ def health():
             mail(subject, body, key=key, level='alert')
         else:
             resolved(key, {'memory': 'Memory back to normal', 'disk': 'Disk back under the limit',
-                           'containers': 'Every container running again', 'https': 'EdgeShell answering again',
-                           'cert': 'TLS certificate renewed', 'replication': 'Data lake replication healthy again',
+                           'containers': 'Every container running again', 'https': f'{C["APP_NAME"]} answering again',
+                           'cert': 'TLS certificate renewed', 'replication': 'Database replication healthy again',
                            'backup': 'Backups fresh again', 'reboot': 'Rebooted, no restart pending'}.get(key, key + ' ok'))
     fresh = new_bans()
     try:
@@ -529,7 +547,8 @@ def fail2ban():
 
 
 WHY = {'sshd': 'guessing SSH logins', 'recidive': 'banned again and again (every port, 1 week)',
-       'nginx-limit-req': 'flooding the sign-in pages', 'edgeshell-probe': 'probing for .env, .git or admin pages'}
+       'nginx-limit-req': 'flooding the sign-in pages', 'edgeshell-probe': 'probing for .env, .git or admin pages',
+       'web-probe': 'probing for .env, .git or admin pages'}
 
 
 def new_bans(jails=None):
@@ -569,13 +588,20 @@ def snapshot():
     return {f: sha(f) for f in sorted({f for pat in WATCHED for f in glob.glob(pat)})}
 
 
+def web(action):
+    """Stop or start the web server: a Compose service with STACK_DIR, else a systemd unit."""
+    svc = shlex.quote(C['WEB_SERVICE'])
+    return compose(f'{action} {svc}') if C['STACK_DIR'] else sh(f'systemctl {action} {svc}', 60)
+
+
 def lockdown(reason):
     s = load()
     if C['LOCKDOWN'] == 'web':
-        compose('stop nginx')
+        web('stop')
         s['lockdown'] = {'at': now(), 'reason': reason}
         save(s)
-        return 'nginx stopped: EdgeShell is unreachable from the internet until you run: sudo hostguard unlock'
+        return (f'{C["WEB_SERVICE"]} stopped: {C["APP_NAME"]} is unreachable from the internet until you run: '
+                'sudo hostguard unlock')
     return 'LOCKDOWN is "alert": nothing stopped. Investigate now.'
 
 
@@ -654,8 +680,8 @@ def unlock():
     s = load()
     s.pop('lockdown', None)
     save(s)
-    compose('start nginx')
-    print('nginx started')
+    web('start')
+    print(C['WEB_SERVICE'], 'started')
 
 
 # ---------------------------------------------------------------- feeds (every 6 h)
@@ -857,20 +883,51 @@ def s3(method, key, body=b'', extra=None):
 # ---------------------------------------------------------------- backup (nightly) and restore test (weekly)
 DUMP = ("exec -T {svc} sh -c 'mariadb-dump -uroot -p\"$MARIADB_ROOT_PASSWORD\" --all-databases --single-transaction "
         "--routines --events --triggers --hex-blob'")
+MARIADB_DUMP_LOCAL = 'mariadb-dump --all-databases --single-transaction --routines --events --triggers --hex-blob'
+PG_DUMP = "exec -T {svc} pg_dumpall -U {user}"
+PG_DUMP_LOCAL = 'sudo -u postgres pg_dumpall'
+PG_LIST_DBS = 'SELECT datname FROM pg_database WHERE NOT datistemplate'
+PG_COUNT_TABLES = ("SELECT count(*) FROM information_schema.tables "
+                   "WHERE table_schema NOT IN ('pg_catalog', 'information_schema')")
+
+
+def backup_configured():
+    return bool(C['BACKUP_CMD'] or C['DB_ENGINE'] in ('mariadb', 'postgres'))
+
+
+def dump_command():
+    """The shell command that writes the backup to stdout, and the file's inner extension."""
+    if C['BACKUP_CMD']:
+        return C['BACKUP_CMD'], 'gz'
+    if C['DB_ENGINE'] == 'mariadb':
+        if C['STACK_DIR'] and C['DB_SERVICE']:
+            return f'docker compose --project-directory {shlex.quote(C["STACK_DIR"])} ' + DUMP.format(
+                svc=shlex.quote(C['DB_SERVICE'])), 'sql.gz'
+        return MARIADB_DUMP_LOCAL, 'sql.gz'
+    if C['DB_ENGINE'] == 'postgres':
+        if C['STACK_DIR'] and C['DB_SERVICE']:
+            return f'docker compose --project-directory {shlex.quote(C["STACK_DIR"])} ' + PG_DUMP.format(
+                svc=shlex.quote(C['DB_SERVICE']), user=shlex.quote(C['PG_USER'])), 'sql.gz'
+        return PG_DUMP_LOCAL, 'sql.gz'
+    return None, None
 
 
 def backup():
     os.makedirs(C['BACKUP_DIR'], mode=0o700, exist_ok=True)
     if not C['BACKUP_PASSPHRASE']:
         raise SystemExit(f'no BACKUP_PASSPHRASE in {C["ENV_FILE"]} (install.sh creates it; keep a copy offline)')
+    cmd, ext = dump_command()
+    if not cmd:
+        print('nothing to back up: set DB_ENGINE or BACKUP_CMD (docs/CONFIGURATION.md)')
+        return
     t = dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-    name = f'edgeshell-db-{t}.sql.gz.gpg'
+    name = f'{C["BACKUP_PREFIX"]}-{t}.{ext}.gpg'
     target = os.path.join(C['BACKUP_DIR'], name)
     raw = target[:-4]
-    rc, text = sh(f'docker compose --project-directory {C["EDGESHELL_DIR"]} {DUMP.format(svc="mariadb")} | gzip -9 > {raw}', 1800)
+    rc, text = sh('bash -o pipefail -c ' + shlex.quote(f'{cmd} | gzip -9 > {shlex.quote(raw)}'), 1800)
     size = os.path.getsize(raw) if os.path.exists(raw) else 0
-    if rc != 0 or size < 1024:
-        mail('Backup FAILED', f'The database dump did not complete (exit {rc}, {size} bytes):\n{text[-800:]}',
+    if rc != 0 or size < int(C['BACKUP_MIN_BYTES']):
+        mail('Backup FAILED', f'The backup did not complete (exit {rc}, {size} bytes):\n{text[-800:]}',
              key='backup-failed', level='alert')
         raise SystemExit(1)
     rc, text = sh(f'gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 '
@@ -896,7 +953,7 @@ def backup():
             mail('Backup upload not confirmed', f'HEAD answered {st2}', key='backup-upload', level='alert')
             raise SystemExit(1)
         resolved('backup-upload', 'Backup uploads working again')
-    for old in sorted(glob.glob(os.path.join(C['BACKUP_DIR'], 'edgeshell-db-*.gpg')))[:-int(C['BACKUP_KEEP'])]:
+    for old in sorted(glob.glob(os.path.join(C['BACKUP_DIR'], f'{C["BACKUP_PREFIX"]}-*.gpg')))[:-int(C['BACKUP_KEEP'])]:
         os.remove(old)
     s = load()
     s['backup'] = {'at': now(), 'name': name, 'bytes': os.path.getsize(target), 'sha256': digest, 's3': uploaded}
@@ -906,8 +963,9 @@ def backup():
 
 
 def restore_test():
-    """The newest backup, from S3 when configured (else local), decrypted and loaded
-    into a throwaway MariaDB; table and row counts reported."""
+    """The newest backup, from S3 when configured (else local), decrypted and loaded into
+    a throwaway MariaDB or PostgreSQL container (table counts reported). Output of
+    BACKUP_CMD, or a server without Docker: decrypted and unpacked completely."""
     s = load()
     name = s.get('backup', {}).get('name')
     if not name:
@@ -925,21 +983,47 @@ def restore_test():
     else:
         shutil.copy(os.path.join(C['BACKUP_DIR'], name), enc)
     ok_sum = hashlib.sha256(open(enc, 'rb').read()).hexdigest() == s['backup']['sha256']
-    rc, text = sh(f'gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 -d {enc} '
-                  f'| gunzip > {work}/dump.sql', 900, input=C['BACKUP_PASSPHRASE'] + '\n')
+    rc, text = sh('bash -o pipefail -c ' + shlex.quote(f'gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 '
+                                                       f'-d {enc} | gunzip > {work}/dump.sql'),
+                  900, input=C['BACKUP_PASSPHRASE'] + '\n')
     lines = []
-    if rc == 0 and ok_sum:
+    docker = shutil.which('docker') is not None
+    how = 'decrypted and unpacked'
+    if rc == 0 and ok_sum and (C['BACKUP_CMD'] or C['DB_ENGINE'] not in ('mariadb', 'postgres') or not docker):
+        size = os.path.getsize(f'{work}/dump.sql')
+        lines = [f'{size // 1024} KB after unpacking'] if size > 0 else []
+    elif rc == 0 and ok_sum and C['DB_ENGINE'] == 'postgres':
+        how = 'into a throwaway PostgreSQL'
         pw = base64.b16encode(os.urandom(12)).decode()
         cname = 'host-guard-restore-test'
         sh(f'docker rm -f {cname}', 30)
-        sh(f'docker run -d --name {cname} -e MARIADB_ROOT_PASSWORD={pw} -v {work}:/restore:ro mariadb:11.4', 300)
+        sh(f'docker run -d --name {cname} -e POSTGRES_PASSWORD={pw} -v {work}:/restore:ro {C["PG_IMAGE"]}', 300)
+        for _ in range(60):
+            if sh(f'docker exec {cname} pg_isready -U postgres', 20)[0] == 0:
+                break
+            time.sleep(2)
+        rc, text = sh(f'docker exec {cname} psql -q -U postgres -v ON_ERROR_STOP=0 -f /restore/dump.sql', 1800)
+        if rc == 0:
+            psql = f'docker exec {cname} psql -U postgres -At'
+            dbs = sh(psql + ' -c ' + shlex.quote(PG_LIST_DBS), 60)[1]
+            for db in dbs.split():                     # names only go to -d, quoted; the SQL is fixed
+                n = sh(f'{psql} -d {shlex.quote(db)} -c ' + shlex.quote(PG_COUNT_TABLES), 60)[1]
+                lines.append(f'{db}: {n.strip()} tables')
+        sh(f'docker rm -f {cname}', 60)
+    elif rc == 0 and ok_sum:
+        how = 'into a throwaway MariaDB'
+        pw = base64.b16encode(os.urandom(12)).decode()
+        cname = 'host-guard-restore-test'
+        sh(f'docker rm -f {cname}', 30)
+        sh(f'docker run -d --name {cname} -e MARIADB_ROOT_PASSWORD={pw} -v {work}:/restore:ro {C["MARIADB_IMAGE"]}', 300)
         for _ in range(60):
             if sh(f'docker exec {cname} healthcheck.sh --connect', 20)[0] == 0:
                 break
             time.sleep(2)
         rc, text = sh(f"docker exec {cname} sh -c 'mariadb -uroot -p{pw} < /restore/dump.sql'", 1800)
         if rc == 0:
-            q = ("SELECT table_name, table_rows FROM information_schema.tables WHERE table_schema='edgeshell' "
+            q = ("SELECT concat(table_schema, '.', table_name), table_rows FROM information_schema.tables WHERE "
+                 "table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys') "
                  "ORDER BY table_rows DESC LIMIT 12")
             rc2, rows = sh(f"docker exec {cname} mariadb -uroot -p{pw} -N -e \"{q}\"", 120)
             lines = rows.splitlines()
@@ -951,7 +1035,7 @@ def restore_test():
     save(s)
     mail('Restore test ' + ('passed' if good else 'FAILED'),
          f'Backup {name}: checksum {"matches" if ok_sum else "DOES NOT MATCH"}, restored '
-         f'{"into a throwaway MariaDB" if good else "with errors: " + text[-400:]}.\n\nLargest tables (rows):\n' +
+         f'{how if good else "with errors: " + text[-400:]}.\n\nWhat it holds:\n' +
          '\n'.join(lines), level='info' if good else 'alert')
     print('restore-test:', 'ok' if good else 'FAILED')
     if not good:
@@ -1308,13 +1392,15 @@ def report_text():
     rows = containers()
     bad = [r['service'] for r in rows if r.get('service') not in ONE_SHOT and
            (r.get('state') != 'running' or r.get('health') == 'unhealthy')]
-    parts += ['', '== Containers'] + [f'  {r["service"]:<14}  {r["status"]}' for r in rows]
-    live = [r for r in rows if r.get('service') not in ONE_SHOT]          # one-shot setup containers exit by design
-    mark('Containers', not bad, f'{len(live) - len(bad)} of {len(live)} services running'
-         + (f'; not well: {", ".join(bad)}' if bad else ''))
+    if C['STACK_DIR']:
+        parts += ['', '== Containers'] + [f'  {r["service"]:<14}  {r["status"]}' for r in rows]
+        live = [r for r in rows if r.get('service') not in ONE_SHOT]      # one-shot setup containers exit by design
+        mark('Containers', not bad, f'{len(live) - len(bad)} of {len(live)} services running'
+             + (f'; not well: {", ".join(bad)}' if bad else ''))
 
     st, fleet, alerts = api('/status'), api('/fleet/summary'), api('/alerts')
-    parts += ['', '== EdgeShell']
+    if st:
+        parts += ['', '== EdgeShell']
     if st and 'error' not in st:
         parts.append(f'Version {st.get("version")}, nodes online {st["nodes"]["online"]} of {st["nodes"]["total"]}')
         if fleet and 'fleet' in fleet:
@@ -1328,21 +1414,20 @@ def report_text():
                          f'{a.get("nodes", 0)} node(s)')
         mark('EdgeShell', not crit, f'{st.get("version")}, {st["nodes"]["online"]}/{st["nodes"]["total"]} nodes online'
              + (f', {crit} critical node alert(s)' if crit else ''))
-    else:
-        parts.append('(set EDGESHELL_KEY to a read-only service key for fleet numbers)' if not st
-                     else f'API: {st.get("error")}')
+    elif st:
+        parts.append(f'API: {st.get("error")}')
 
     ok, detail = replication()
-    parts += ['', '== Data lake', f'Replication: {detail}' if ok is not None else 'Replication: not configured']
     if ok is not None:
-        mark('Data lake replication', ok, detail)
+        parts += ['', '== Database replica', f'Replication: {detail}']
+        mark('Database replication', ok, detail)
 
     b, rt = s.get('backup', {}), s.get('restore_test', {})
     fresh = bool(b.get('at')) and now() - b['at'] < float(C['BACKUP_MAX_AGE_H']) * 3600
     parts += ['', '== Backups', f'Last backup: {b.get("name", "none")} ({ago(b.get("at"))}, '
               f'{b.get("bytes", 0) // 1024} KB, S3: {"yes" if b.get("s3") else "no"})',
               f'Restore test: {"PASSED" if rt.get("ok") else "not passed yet"} ({ago(rt.get("at"))})']
-    mark('Backups', fresh and rt.get('ok', True), f'last {ago(b.get("at"))}, restore test '
+    mark('Backups', (fresh and rt.get('ok', True)) if backup_configured() else False, f'last {ago(b.get("at"))}, restore test '
          + ('passed' if rt.get('ok') else 'not run yet' if not rt else 'FAILED'))
 
     rc, ssh_fail = sh("journalctl -u ssh -u sshd --since -24h -o cat 2>/dev/null | grep -cE 'Invalid user|"
@@ -1353,7 +1438,7 @@ def report_text():
     parts += ['', '== Security (24 h)', f'SSH failed attempts: {ssh_fail.strip() or 0}',
               f'Addresses banned: {len(day_bans)}',
               'Banned now (since start): ' + (', '.join(f'{j} {v["now"]} ({v["total"]})' for j, v in jails.items())
-                                             or "fail2ban not running (run EdgeShell's host-hardening.sh)"),
+                                             or 'fail2ban not running (run install.sh again)'),
               f'Host watch: {len(find)} finding(s)'] + ['  ' + f for f in find[:10]]
     if s.get('lockdown'):
         parts.append(f'LOCKDOWN since {stamp(s["lockdown"]["at"])}: {s["lockdown"]["reason"]}')

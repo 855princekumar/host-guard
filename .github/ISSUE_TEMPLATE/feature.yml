@@ -1,0 +1,14 @@
+name: Idea
+description: A check, a profile or a change that would help
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you want to catch or make easier
+    validations:
+      required: true
+  - type: textarea
+    id: how
+    attributes:
+      label: How you would do it (optional)

@@ -1,0 +1,26 @@
+name: Bug
+description: Something host-guard does wrong or not at all
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "Security problem? Please report it privately instead (SECURITY.md). Never paste secrets, passwords, keys or your .env here."
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Server
+      placeholder: "Ubuntu 24.04 on a VPS, Docker 27, profile compose-postgres"
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: "sudo hostguard status, and journalctl -u host-guard-<job> -n 50 (remove addresses you do not want public)"
+      render: text

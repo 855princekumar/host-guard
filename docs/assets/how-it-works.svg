@@ -1,0 +1,129 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 600" width="1280" height="600" role="img" aria-labelledby="t d">
+  <title id="t">How host-guard works</title>
+  <desc id="d">systemd timers on the server start host-guard's jobs. Health and intrusion watch run every 5 minutes, early warning every 6 hours, the backup nightly, and the scan, patch window and restore test weekly. Results go to every admin by mail as alerts and a daily report, and to an optional local panel through a status file without secrets.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .card { fill: #ffffff; stroke: #d5dde6; stroke-width: 1.5; }
+      .h { font: 700 22px 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; fill: #0f172a; }
+      .t { font: 600 17px 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; fill: #0f172a; }
+      .m { font: 400 14px 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; fill: #475569; }
+      .mono { font: 500 13px ui-monospace, 'Cascadia Mono', Consolas, monospace; fill: #334155; }
+      .lab { font: 600 12px ui-monospace, 'Cascadia Mono', Consolas, monospace; letter-spacing: .06em; fill: #64748b; }
+      .wire { fill: none; stroke: #b6c3d1; stroke-width: 2; }
+      .dot { fill: #22a06b; }
+      .pill { font: 700 11px ui-monospace, 'Cascadia Mono', Consolas, monospace; fill: #ffffff; }
+      @media (prefers-reduced-motion: reduce) { .anim { display: none; } }
+    </style>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 Z" fill="#b6c3d1"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="600" class="bg"/>
+
+  <!-- column labels -->
+  <text x="60" y="48" class="lab">1  THE SERVER STARTS IT</text>
+  <text x="420" y="48" class="lab">2  HOST-GUARD CHECKS AND ACTS</text>
+  <text x="920" y="48" class="lab">3  PEOPLE ARE TOLD</text>
+
+  <!-- 1: the server and its clock -->
+  <rect x="40" y="70" width="320" height="470" rx="14" class="card"/>
+  <text x="64" y="108" class="h">Your server</text>
+  <text x="64" y="132" class="m">EC2, any VPS or bare metal</text>
+  <g transform="translate(200 270)">
+    <circle r="92" fill="#f1f5f9" stroke="#cbd5e1" stroke-width="2"/>
+    <g stroke="#94a3b8" stroke-width="3" stroke-linecap="round">
+      <line x1="0" y1="-80" x2="0" y2="-70"/><line x1="80" y1="0" x2="70" y2="0"/>
+      <line x1="0" y1="80" x2="0" y2="70"/><line x1="-80" y1="0" x2="-70" y2="0"/>
+    </g>
+    <line x1="0" y1="0" x2="0" y2="-62" stroke="#0f172a" stroke-width="4" stroke-linecap="round">
+      <animateTransform class="anim" attributeName="transform" type="rotate" from="0" to="360" dur="12s" repeatCount="indefinite"/>
+    </line>
+    <line x1="0" y1="0" x2="40" y2="0" stroke="#22a06b" stroke-width="5" stroke-linecap="round">
+      <animateTransform class="anim" attributeName="transform" type="rotate" from="0" to="360" dur="144s" repeatCount="indefinite"/>
+    </line>
+    <circle r="7" fill="#0f172a"/>
+  </g>
+  <text x="200" y="398" text-anchor="middle" class="t">systemd timers</text>
+  <text x="200" y="420" text-anchor="middle" class="m">no agent, no daemon of its own</text>
+  <text x="64" y="470" class="mono">python3 + systemd + msmtp</text>
+  <text x="64" y="494" class="mono">gpg, fail2ban, Trivy, Lynis</text>
+  <text x="64" y="518" class="mono">one root-only .env for secrets</text>
+
+  <!-- 2: the jobs -->
+  <g font-family="sans-serif">
+    <rect x="400" y="70" width="460" height="70" rx="12" class="card"/>
+    <text x="424" y="100" class="t">Health</text><text x="424" y="123" class="m">disk, memory, containers, HTTPS, certificate, replication</text>
+    <text x="840" y="100" text-anchor="end" class="mono">5 min</text>
+
+    <rect x="400" y="152" width="460" height="70" rx="12" class="card"/>
+    <text x="424" y="182" class="t">Intrusion watch</text><text x="424" y="205" class="m">root accounts, SSH keys, sudo and cron files, miners</text>
+    <text x="840" y="182" text-anchor="end" class="mono">5 min</text>
+
+    <rect x="400" y="234" width="460" height="70" rx="12" class="card"/>
+    <text x="424" y="264" class="t">Early warning</text><text x="424" y="287" class="m">CISA KEV, Ubuntu notices, OSV: only what runs here</text>
+    <text x="840" y="264" text-anchor="end" class="mono">6 h</text>
+
+    <rect x="400" y="316" width="460" height="70" rx="12" class="card"/>
+    <text x="424" y="346" class="t">Encrypted backup</text><text x="424" y="369" class="m">database or any command, AES-256, optional S3 copy</text>
+    <text x="840" y="346" text-anchor="end" class="mono">nightly</text>
+
+    <rect x="400" y="398" width="460" height="70" rx="12" class="card"/>
+    <text x="424" y="428" class="t">Restore test and scan</text><text x="424" y="451" class="m">backup loaded into a throwaway DB; Trivy, Lynis</text>
+    <text x="840" y="428" text-anchor="end" class="mono">weekly</text>
+
+    <rect x="400" y="480" width="460" height="60" rx="12" class="card"/>
+    <text x="424" y="508" class="t">Patch window</text><text x="424" y="528" class="m">reboot only after a fresh backup</text>
+    <text x="840" y="508" text-anchor="end" class="mono">Sun 03:30</text>
+  </g>
+
+  <!-- wires from the clock to the jobs and from the jobs to the people -->
+  <path id="w1" class="wire" d="M292 270 C340 270 350 105 398 105" marker-end="url(#arr)"/>
+  <path id="w2" class="wire" d="M292 270 C340 270 350 187 398 187" marker-end="url(#arr)"/>
+  <path id="w3" class="wire" d="M292 270 C340 270 350 269 398 269" marker-end="url(#arr)"/>
+  <path id="w4" class="wire" d="M292 270 C340 270 350 351 398 351" marker-end="url(#arr)"/>
+  <path id="w5" class="wire" d="M292 270 C340 270 350 433 398 433" marker-end="url(#arr)"/>
+  <path id="w6" class="wire" d="M292 270 C340 270 350 510 398 510" marker-end="url(#arr)"/>
+  <path id="o1" class="wire" d="M862 187 C890 187 890 160 918 160" marker-end="url(#arr)"/>
+  <path id="o2" class="wire" d="M862 351 C890 351 890 330 918 330" marker-end="url(#arr)"/>
+  <path id="o3" class="wire" d="M862 433 C890 433 890 470 918 470" marker-end="url(#arr)"/>
+
+  <g class="anim">
+    <circle r="5" class="dot"><animateMotion dur="2.4s" repeatCount="indefinite"><mpath href="#w1"/></animateMotion></circle>
+    <circle r="5" class="dot"><animateMotion dur="2.4s" begin="-0.4s" repeatCount="indefinite"><mpath href="#w2"/></animateMotion></circle>
+    <circle r="5" class="dot"><animateMotion dur="2.4s" begin="-0.8s" repeatCount="indefinite"><mpath href="#w3"/></animateMotion></circle>
+    <circle r="5" class="dot"><animateMotion dur="2.4s" begin="-1.2s" repeatCount="indefinite"><mpath href="#w4"/></animateMotion></circle>
+    <circle r="5" class="dot"><animateMotion dur="2.4s" begin="-1.6s" repeatCount="indefinite"><mpath href="#w5"/></animateMotion></circle>
+    <circle r="5" class="dot"><animateMotion dur="2.4s" begin="-2.0s" repeatCount="indefinite"><mpath href="#w6"/></animateMotion></circle>
+    <circle r="5" fill="#d97706"><animateMotion dur="1.6s" begin="-1s" repeatCount="indefinite"><mpath href="#o1"/></animateMotion></circle>
+    <circle r="5" fill="#22a06b"><animateMotion dur="1.6s" begin="-1.5s" repeatCount="indefinite"><mpath href="#o2"/></animateMotion></circle>
+    <circle r="5" fill="#2563eb"><animateMotion dur="1.6s" begin="-2s" repeatCount="indefinite"><mpath href="#o3"/></animateMotion></circle>
+  </g>
+
+  <!-- 3: people -->
+  <rect x="920" y="70" width="320" height="330" rx="14" class="card"/>
+  <text x="944" y="108" class="h">Every admin's inbox</text>
+  <text x="944" y="132" class="m">HTML mail, plain text inside too</text>
+  <g transform="translate(944 156)">
+    <rect width="86" height="22" rx="11" fill="#b42318"/><text x="43" y="15" text-anchor="middle" class="pill">CRITICAL</text>
+    <text x="100" y="16" class="m">act now</text>
+    <rect y="34" width="86" height="22" rx="11" fill="#b54708"/><text x="43" y="49" text-anchor="middle" class="pill">ATTENTION</text>
+    <text x="100" y="50" class="m">look today</text>
+    <rect y="68" width="86" height="22" rx="11" fill="#067647"/><text x="43" y="83" text-anchor="middle" class="pill">RESOLVED</text>
+    <text x="100" y="84" class="m">back to normal</text>
+    <rect y="102" width="86" height="22" rx="11" fill="#1d4ed8"/><text x="43" y="117" text-anchor="middle" class="pill">INFO</text>
+    <text x="100" y="118" class="m">routine</text>
+  </g>
+  <text x="944" y="312" class="t">Daily report, 09:00</text>
+  <text x="944" y="334" class="m">at a glance: OK or ATTENTION per area,</text>
+  <text x="944" y="354" class="m">then what needs a person, then details</text>
+  <text x="944" y="380" class="m">and the running cost</text>
+
+  <rect x="920" y="420" width="320" height="120" rx="14" class="card"/>
+  <text x="944" y="456" class="t">Panel (optional)</text>
+  <text x="944" y="480" class="m">127.0.0.1 only, one admin,</text>
+  <text x="944" y="500" class="m">password + authenticator code;</text>
+  <text x="944" y="520" class="m">reads a status file without secrets</text>
+
+  <text x="640" y="582" text-anchor="middle" class="m">A problem mails once, then "resolved"; the same problem at most every 6 hours.</text>
+</svg>
