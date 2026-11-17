@@ -95,7 +95,7 @@ open(f, 'w').write('\n'.join(lines) + '\n')
 PY
 }
 for k in EDGESHELL_KEY AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY; do   # secrets once kept in guard.conf move here
-  v="$(sed -n "s/^$k=//p" /etc/host-guard/guard.conf 2>/dev/null | tail -1)"
+  v=""; [ -f /etc/host-guard/guard.conf ] && v="$(sed -n "s/^$k=//p" /etc/host-guard/guard.conf | tail -1)"
   [ -n "$v" ] && HG_VALUE="$v" setenv "$k"
   [ -f /etc/host-guard/guard.conf ] && sed -i "/^$k=/d" /etc/host-guard/guard.conf
 done

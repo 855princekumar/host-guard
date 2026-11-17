@@ -43,6 +43,16 @@ jobs:
           fetch-depth: 0
       - run: docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.24.0 git /repo --no-banner --redact -v
 
+  fresh-install:
+    name: Fresh install (Ubuntu ${{ matrix.ubuntu }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        ubuntu: ["24.04", "26.04"]
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker run --rm -v "$PWD/guard:/src:ro" -v "$PWD/ci/fresh_install.sh:/t.sh:ro" ubuntu:${{ matrix.ubuntu }} bash /t.sh
+
   shell:
     name: Shell scripts
     runs-on: ubuntu-24.04
