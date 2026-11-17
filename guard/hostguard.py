@@ -138,7 +138,10 @@ def path(name):
     return os.path.join(C['STATE_DIR'], name)
 
 
-def load(name='state.json'):
+_LOADED = {}          # file name -> its content when this run read it
+
+
+def _read(name):
     try:
         with open(path(name), encoding='utf-8') as f:
             return json.load(f)
@@ -146,11 +149,38 @@ def load(name='state.json'):
         return {}
 
 
+def _copy(data):
+    return json.loads(json.dumps(data, default=str))
+
+
+def load(name='state.json'):
+    data = _read(name)
+    _LOADED[name] = _copy(data)
+    return data
+
+
 def save(data, name='state.json'):
-    tmp = path(name) + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=1, sort_keys=True)
-    os.replace(tmp, path(name))
+    """Write back only the keys this run changed, onto the file as it is now, under a lock:
+    health and watch start together every 5 minutes, and a whole-file write by one
+    would undo the other's result."""
+    try:
+        import fcntl
+    except ImportError:                  # not Linux (tests elsewhere): no lock
+        fcntl = None
+    with open(path(name) + '.lock', 'w') as lock:
+        if fcntl:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        base, new, cur = _LOADED.get(name, {}), _copy(data), _read(name)
+        for k in set(base) | set(new):
+            if k not in new:
+                cur.pop(k, None)
+            elif base.get(k) != new[k]:
+                cur[k] = new[k]
+        tmp = path(name) + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(cur, f, indent=1, sort_keys=True)
+        os.replace(tmp, path(name))
+        _LOADED[name] = _copy(cur)
 
 
 def sh(cmd, timeout=120, input=None):
@@ -192,6 +222,89 @@ def recipients():
     return good
 
 
+LEVELS = {'critical': ('#b42318', 'Critical: act now'), 'alert': ('#b54708', 'Attention needed'),
+          'resolved': ('#067647', 'Resolved'), 'info': ('#1d4ed8', 'For information')}
+BADGES = {'OK': '#067647', 'PASSED': '#067647', 'YES': '#067647', 'ATTENTION': '#b54708', 'WARNING': '#b54708',
+          'CRITICAL': '#b42318', 'FAILED': '#b42318', 'NO': '#b54708'}
+KV = re.compile(r'^([A-Z][\w /()%.,+-]{0,38}): (\S.*)$')
+
+
+def _cell(text, first=False):
+    import html as h
+    t = text.strip()
+    color = BADGES.get(t.upper()) if not first else None
+    if color:
+        return (f'<span style="background:{color};color:#fff;border-radius:10px;padding:1px 9px;font-size:12px;'
+                f'font-weight:600">{h.escape(t)}</span>')
+    return h.escape(t)
+
+
+def mail_html(subject, body, level, footer):
+    """The mail as HTML, built from the plain text (which stays in the mail as the
+    fallback): '== X' a heading, 'Key: value' a table row, indented lines with column
+    gaps a table, other indented lines bullets. Everything is escaped: log lines can
+    carry an attacker's text."""
+    import html as h
+    color, label = LEVELS.get(level, LEVELS['info'])
+    td = 'padding:5px 10px;border-bottom:1px solid #eaecf0;vertical-align:top;font-size:14px'
+    out, group, kind = [], [], None
+
+    def flush():
+        nonlocal group, kind
+        if kind == 'kv':
+            out.append('<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;margin:4px 0 10px">'
+                       + ''.join(f'<tr><td style="{td};color:#475467;width:36%;white-space:nowrap">{h.escape(k)}</td>'
+                                 f'<td style="{td}">{_cell(v)}</td></tr>' for k, v in group) + '</table>')
+        elif kind == 'table':
+            n = max(len(r) for r in group)
+            out.append('<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;margin:4px 0 10px">'
+                       + ''.join('<tr>' + ''.join(f'<td style="{td}{";font-weight:600" if i == 0 else ""}">'
+                                                  f'{_cell(c, i == 0)}</td>' for i, c in enumerate(r + [''] * (n - len(r))))
+                                 + '</tr>' for r in group) + '</table>')
+        elif kind == 'ul':
+            out.append('<ul style="margin:4px 0 10px;padding-left:20px">' + ''.join(
+                f'<li style="margin:3px 0;font-size:14px">{h.escape(x)}</li>' for x in group) + '</ul>')
+        elif kind == 'p':
+            out.append(''.join(f'<p style="margin:6px 0;font-size:14px">{h.escape(x)}</p>' for x in group))
+        group, kind = [], None
+
+    def add(k, item):
+        nonlocal kind
+        if kind != k:
+            flush()
+            kind = k
+        group.append(item)
+
+    for line in body.splitlines():
+        if not line.strip():
+            flush()
+        elif line.startswith('== '):
+            flush()
+            out.append(f'<h3 style="margin:18px 0 6px;padding:6px 10px;background:#f2f4f7;border-left:4px solid {color};'
+                       f'font-size:15px;color:#101828">{h.escape(line[3:].strip())}</h3>')
+        elif line.startswith('  '):
+            cells = re.split(r'\s{2,}', line.strip())
+            if len(cells) > 1:
+                add('table', cells)
+            else:
+                add('ul', line.strip().lstrip('-* '))
+        elif KV.match(line):
+            add('kv', KV.match(line).groups())
+        else:
+            add('p', line)
+    flush()
+    return ('<!doctype html><html><body style="margin:0;padding:16px;background:#f9fafb;'
+            'font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;color:#101828">'
+            '<div style="max-width:720px;margin:0 auto;background:#fff;border:1px solid #eaecf0;border-radius:8px;overflow:hidden">'
+            f'<div style="background:{color};color:#fff;padding:14px 18px">'
+            f'<div style="font-size:12px;text-transform:uppercase;letter-spacing:.06em;opacity:.9">{h.escape(label)}'
+            f' &middot; {h.escape(C["SITE"])}</div>'
+            f'<div style="font-size:18px;font-weight:600;margin-top:4px">{h.escape(subject)}</div></div>'
+            f'<div style="padding:8px 18px 14px">{"".join(out)}</div>'
+            f'<div style="padding:10px 18px;border-top:1px solid #eaecf0;color:#667085;font-size:12px">{h.escape(footer)}'
+            '</div></div></body></html>')
+
+
 def mail(subject, body, key=None, level='info'):
     """Send one mail. With a key, the same problem mails at most once per COOLDOWN_H
     hours; resolved() clears it. Returns True when a mail went out."""
@@ -206,10 +319,17 @@ def mail(subject, body, key=None, level='info'):
     rcpts = recipients()
     to = ', '.join(rcpts)
     frm = C['MAIL_FROM'] or (rcpts[0] if rcpts else '')
+    subject = re.sub(r'[\r\n]+', ' ', subject)                     # never a second header
+    footer = f'host-guard on {C["SITE"]}{" | " + C["EDGESHELL_URL"] if C["EDGESHELL_URL"] else ""} | {stamp()}'
+    text = '\n'.join(line[:900] for line in f'{body}\n\n-- \n{footer}\n'.splitlines()) + '\n'
+    page = base64.encodebytes(mail_html(subject, body, level, footer).encode()).decode()
+    bnd = 'hg-' + hashlib.sha256(f'{now()}{subject}'.encode()).hexdigest()[:24]
     msg = (f'To: {to}\nFrom: host-guard {C["SITE"]} <{frm}>\nSubject: {tag}[{C["SITE"]}] {subject}\n'
            f'Date: {dt.datetime.now(dt.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")}\n'
-           f'Content-Type: text/plain; charset=UTF-8\n\n{body}\n\n-- \nhost-guard on {C["SITE"]}'
-           f'{" | " + C["EDGESHELL_URL"] if C["EDGESHELL_URL"] else ""} | {stamp()}\n')
+           f'MIME-Version: 1.0\nContent-Type: multipart/alternative; boundary="{bnd}"\n\n'
+           f'--{bnd}\nContent-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: 8bit\n\n{text}\n'
+           f'--{bnd}\nContent-Type: text/html; charset=UTF-8\nContent-Transfer-Encoding: base64\n\n{page}\n'
+           f'--{bnd}--\n')
     log = load('mail-log.json')
     log.setdefault('sent', []).append({'at': now(), 'subject': f'{tag}{subject}', 'level': level})
     log['sent'] = log['sent'][-200:]
@@ -280,7 +400,7 @@ def replication():
                        timeout=30)
     if rc != 0:
         return None, 'replica not reachable: ' + text.splitlines()[-1][:120] if text else 'replica not reachable'
-    f = dict(re.findall(r'^\s*(\w+):\s*(.*)$', text, re.M))
+    f = dict(re.findall(r'^[ \t]*(\w+):[ \t]*(.*)$', text, re.M))     # an empty value stays empty
     if not f:
         return None, 'no replication configured'
     io_ok, sql_ok = f.get('Slave_IO_Running', f.get('Replica_IO_Running')), f.get('Slave_SQL_Running', f.get('Replica_SQL_Running'))
@@ -315,7 +435,7 @@ def cert_days():
     if not m:
         return None
     end = dt.datetime.strptime(m.group(1).strip().replace('  ', ' '), '%b %d %H:%M:%S %Y %Z')
-    return (end - dt.datetime.utcnow()).days
+    return (end - dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)).days
 
 
 def https_code():
@@ -1138,52 +1258,124 @@ def ago(t):
     return f'{h * 60:.0f} min ago' if h < 1 else f'{h:.0f} h ago' if h < 48 else f'{h / 24:.0f} days ago'
 
 
+def _meminfo():
+    try:
+        m = {}
+        for line in open('/proc/meminfo'):
+            k, v = line.split(':', 1)
+            m[k] = int(v.split()[0]) / 1048576
+        return m['MemTotal'], m['MemAvailable']
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+def _uptime():
+    try:
+        days = float(open('/proc/uptime').read().split()[0]) / 86400
+        load_ = open('/proc/loadavg').read().split()[:3]
+        return f'{days:.0f} days' if days >= 1 else f'{days * 24:.0f} h', ' / '.join(load_)
+    except (OSError, ValueError, IndexError):
+        return None, None
+
+
 def report_text():
     s, day = load(), now() - 86400
-    parts = [f'== {C["SITE"]}  {stamp()}', out('uptime')]
-    parts += ['', '== Memory', out('free -h'), '', '== Disk', out('df -h / | tail -1'),
-              f'Backups folder: {out("du -sh " + C["BACKUP_DIR"] + " 2>/dev/null")}']
-    parts += ['', '== Containers'] + [f'{r["service"]:<14} {r["status"]}' for r in containers()]
+    glance = []                                   # (area, OK | ATTENTION, detail)
+
+    def mark(area, ok, detail):
+        glance.append((area, 'OK' if ok else 'ATTENTION', detail))
+
+    up, load_ = _uptime()
+    head = [f'Server: {C["SITE"]}', f'Report time: {stamp()}']
+    head += [f'Up for: {up}', f'Load (1/5/15 min): {load_}'] if up else []
+
+    parts = ['== Memory and disk']
+    mem, used = _meminfo(), None
+    mem_ok = True
+    if mem:
+        total, avail = mem
+        used = 100 - avail * 100 / total
+        parts.append(f'Memory used: {used:.0f}% ({total - avail:.1f} of {total:.1f} GB)')
+        mem_ok = avail * 100 / total >= float(C['MEM_FREE_MIN'])
+    du = shutil.disk_usage('/')
+    disk = int(du.used * 100 / du.total)
+    folder = out('du -sh ' + C['BACKUP_DIR'] + ' 2>/dev/null').split('\t')[0]
+    parts += [f'Root disk used: {disk}% ({du.free / 1e9:.0f} GB free of {du.total / 1e9:.0f} GB)',
+              f'Backups folder: {folder or "empty"}']
+    mark('Memory and disk', mem_ok and disk < int(C['DISK_WARN']),
+         f'disk {disk}% used' + (f', memory {used:.0f}% used' if used is not None else ''))
+
+    rows = containers()
+    bad = [r['service'] for r in rows if r.get('service') not in ONE_SHOT and
+           (r.get('state') != 'running' or r.get('health') == 'unhealthy')]
+    parts += ['', '== Containers'] + [f'  {r["service"]:<14}  {r["status"]}' for r in rows]
+    live = [r for r in rows if r.get('service') not in ONE_SHOT]          # one-shot setup containers exit by design
+    mark('Containers', not bad, f'{len(live) - len(bad)} of {len(live)} services running'
+         + (f'; not well: {", ".join(bad)}' if bad else ''))
+
     st, fleet, alerts = api('/status'), api('/fleet/summary'), api('/alerts')
     parts += ['', '== EdgeShell']
     if st and 'error' not in st:
         parts.append(f'Version {st.get("version")}, nodes online {st["nodes"]["online"]} of {st["nodes"]["total"]}')
         if fleet and 'fleet' in fleet:
-            parts += [f'  {c["name"]:<20} {c["online"]}/{c["total"]} online, availability {c.get("availability_percent")}%'
+            parts += [f'  {c["name"]:<20}  {c["online"]}/{c["total"]} online  availability {c.get("availability_percent")}%'
                       for c in fleet.get('categories', [])]
+        crit = 0
         if alerts and 'summary' in alerts:
             a = alerts['summary']
-            parts.append(f'Open alerts: {a.get("critical", 0)} critical, {a.get("warning", 0)} warning on {a.get("nodes", 0)} node(s)')
+            crit = a.get('critical', 0)
+            parts.append(f'Open alerts: {a.get("critical", 0)} critical, {a.get("warning", 0)} warning on '
+                         f'{a.get("nodes", 0)} node(s)')
+        mark('EdgeShell', not crit, f'{st.get("version")}, {st["nodes"]["online"]}/{st["nodes"]["total"]} nodes online'
+             + (f', {crit} critical node alert(s)' if crit else ''))
     else:
-        parts.append('(set EDGESHELL_KEY to a read-only service key for fleet numbers)' if not st else f'API: {st.get("error")}')
+        parts.append('(set EDGESHELL_KEY to a read-only service key for fleet numbers)' if not st
+                     else f'API: {st.get("error")}')
+
     ok, detail = replication()
-    parts += ['', '== Data lake', detail if ok is not None else 'not configured']
-    b = s.get('backup', {})
-    parts += ['', '== Backups', f'Last: {b.get("name", "none")} ({ago(b.get("at"))}, {b.get("bytes", 0) // 1024} KB, '
-              f'S3: {"yes" if b.get("s3") else "no"})',
-              f'Restore test: {"passed" if s.get("restore_test", {}).get("ok") else "not passed yet"} '
-              f'({ago(s.get("restore_test", {}).get("at"))})']
-    rc, ssh_fail = sh("journalctl -u ssh -u sshd --since -24h -o cat 2>/dev/null | grep -cE 'Invalid user|authentication failure|"
-                      "Failed password|Connection closed by authenticating'")
-    parts += ['', '== Security (24 h)', f'SSH: {ssh_fail.strip() or 0} failed attempts']
+    parts += ['', '== Data lake', f'Replication: {detail}' if ok is not None else 'Replication: not configured']
+    if ok is not None:
+        mark('Data lake replication', ok, detail)
+
+    b, rt = s.get('backup', {}), s.get('restore_test', {})
+    fresh = bool(b.get('at')) and now() - b['at'] < float(C['BACKUP_MAX_AGE_H']) * 3600
+    parts += ['', '== Backups', f'Last backup: {b.get("name", "none")} ({ago(b.get("at"))}, '
+              f'{b.get("bytes", 0) // 1024} KB, S3: {"yes" if b.get("s3") else "no"})',
+              f'Restore test: {"PASSED" if rt.get("ok") else "not passed yet"} ({ago(rt.get("at"))})']
+    mark('Backups', fresh and rt.get('ok', True), f'last {ago(b.get("at"))}, restore test '
+         + ('passed' if rt.get('ok') else 'not run yet' if not rt else 'FAILED'))
+
+    rc, ssh_fail = sh("journalctl -u ssh -u sshd --since -24h -o cat 2>/dev/null | grep -cE 'Invalid user|"
+                      "authentication failure|Failed password|Connection closed by authenticating'")
     jails = fail2ban()
-    day_bans = [b for b in s.get('ban_log', []) if b['at'] > day]
-    parts.append('Bans in 24 h: ' + str(len(day_bans)) + '; banned now / since fail2ban started: ' +
-                 (', '.join(f'{j} {v["now"]}/{v["total"]}' for j, v in jails.items())
-                  or "fail2ban not running (run EdgeShell's host-hardening.sh)"))
+    day_bans = [x for x in s.get('ban_log', []) if x['at'] > day]
     find = [f['text'] for f in s.get('findings', []) if f['at'] > day]
-    parts += [f'Host watch: {len(find)} finding(s)'] + ['  ' + f for f in find[:10]]
+    parts += ['', '== Security (24 h)', f'SSH failed attempts: {ssh_fail.strip() or 0}',
+              f'Addresses banned: {len(day_bans)}',
+              'Banned now (since start): ' + (', '.join(f'{j} {v["now"]} ({v["total"]})' for j, v in jails.items())
+                                             or "fail2ban not running (run EdgeShell's host-hardening.sh)"),
+              f'Host watch: {len(find)} finding(s)'] + ['  ' + f for f in find[:10]]
     if s.get('lockdown'):
         parts.append(f'LOCKDOWN since {stamp(s["lockdown"]["at"])}: {s["lockdown"]["reason"]}')
+    mark('Intrusion watch', not find and not s.get('lockdown'),
+         f'{len(find)} finding(s), {len(day_bans)} address(es) banned' + (', LOCKDOWN' if s.get('lockdown') else ''))
+
     items = [f['text'] for f in s.get('feed_items', []) if f['at'] > day]
-    parts += ['', '== Early warning (24 h)', f'{len(items)} new item(s), last check {ago(s.get("feeds", {}).get("at"))}']
+    parts += ['', '== Early warning (24 h)', f'New items: {len(items)} (last check {ago(s.get("feeds", {}).get("at"))})']
     parts += ['  ' + i for i in items[:15]]
-    upg = out("grep -h 'Packages that will be upgraded' /var/log/unattended-upgrades/unattended-upgrades.log 2>/dev/null | tail -3")
+    urgent = s.get('feeds', {}).get('urgent', 0)
+    mark('Early warning', not urgent, f'{len(items)} new notice(s)' + (f', {urgent} urgent' if urgent else ''))
+
+    upg = out("grep -h 'Packages that will be upgraded' /var/log/unattended-upgrades/unattended-upgrades.log "
+              "2>/dev/null | tail -3")
     pend = out("apt list --upgradable 2>/dev/null | grep -c upgradable")
+    reboot = os.path.exists('/var/run/reboot-required')
     parts += ['', '== Updates', f'Pending: {pend}', 'Recently applied: ' + (upg or 'none logged'),
-              'REBOOT NEEDED (in the window)' if os.path.exists('/var/run/reboot-required') else 'No reboot needed']
+              'Reboot: needed, done in the maintenance window after a backup' if reboot else 'Reboot: not needed']
+    mark('Updates', not reboot, f'{pend} pending' + (', reboot in the maintenance window' if reboot else ''))
+
     sc = s.get('scan', {})
-    parts += ['', '== Last weekly scan', f'{ago(sc.get("at"))}'] + ['  ' + x for x in sc.get('lines', [])]
+    parts += ['', '== Last weekly scan', f'Ran: {ago(sc.get("at"))}'] + ['  ' + x for x in sc.get('lines', [])]
     try:
         nodes = st['nodes']['total'] if st and 'error' not in st else None
         ctext, e = cost_text(nodes)
@@ -1194,8 +1386,13 @@ def report_text():
     except Exception as ex:
         parts += ['', f'== Running cost: not available ({str(ex)[:120]})']
     sent = [m for m in load('mail-log.json').get('sent', []) if m['at'] > day]
-    parts += ['', f'== Mails in 24 h: {len(sent)}'] + [f'  {stamp(m["at"])[11:16]} {m["subject"]}' for m in sent[-15:]]
-    return '\n'.join(str(p) for p in parts)
+    parts += ['', f'== Mails in 24 h: {len(sent)}'] + [f'  {stamp(m["at"])[11:16]}  {m["subject"]}' for m in sent[-15:]]
+
+    problems = [v.get('subject', k) for k, v in sorted(load('alerts.json').items())]
+    top = head + ['', '== At a glance'] + [f'  {a:<22}  {st_}  {d}' for a, st_, d in glance]
+    if problems:
+        top += ['', '== Needs attention'] + ['  ' + p for p in problems]
+    return '\n'.join(str(p) for p in top + [''] + parts)
 
 
 def report():
