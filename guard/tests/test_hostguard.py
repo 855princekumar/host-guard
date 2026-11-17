@@ -13,8 +13,12 @@ import pytest
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+PROFILE = {'STACK_DIR': '/srv/app', 'DB_ENGINE': 'mariadb', 'DB_SERVICE': 'mariadb', 'DB_REPLICA': 'mariadb-lake',
+           'CONTAINERS_PYTHON': 'edgeshell sensehive', 'APP_NAME': 'EdgeShell', 'HEALTH_PATH': '/healthz'}
+
+
 @pytest.fixture
-def hg(tmp_path, monkeypatch):
+def hg(tmp_path, monkeypatch, request):
     sent = tmp_path / 'sent.txt'
     monkeypatch.setenv('HOSTGUARD_CONF', str(tmp_path / 'none.conf'))
     monkeypatch.setenv('HG_STATE_DIR', str(tmp_path / 'state'))
@@ -24,6 +28,14 @@ def hg(tmp_path, monkeypatch):
                        f"open({str(sent)!r}, 'a', encoding='utf-8').write(sys.stdin.read())\n")
     monkeypatch.setenv('HG_NOTIFY_CMD', f'"{sys.executable}" "{catcher}"')
     monkeypatch.setenv('HG_SITE', 'test-host')
+    # most tests run as the EdgeShell profile (examples/profiles/edgeshell.conf): a Compose app with
+    # a MariaDB primary and replica; the test_a_plain_server_* tests run with nothing set
+    if request.node.name.startswith('test_a_plain_server'):
+        for k in PROFILE:
+            monkeypatch.delenv('HG_' + k, raising=False)
+    else:
+        for k, v in PROFILE.items():
+            monkeypatch.setenv('HG_' + k, v)
     spec = importlib.util.spec_from_file_location('hostguard', os.path.join(HERE, 'hostguard.py'))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -120,7 +132,7 @@ def test_the_daily_report_has_every_part(hg, monkeypatch):
     hg.save(s)
     text = hg.report_text()
     for part in ('== Memory', '== Containers', 'edgeshell       Up 3 days (healthy)', 'Version 1.19.0, nodes online 5 of 6',
-                 'Pi Nodes', 'Open alerts: 1 critical, 2 warning on 2 node(s)', '== Data lake', 'IO Yes',
+                 'Pi Nodes', 'Open alerts: 1 critical, 2 warning on 2 node(s)', '== Database replica', 'IO Yes',
                  'edgeshell-db-x.sql.gz.gpg (30 min ago, 2000 KB, S3: yes)', 'Host watch: 1 finding(s)', 'eve',
                  '== Early warning', '== Updates', '== Last weekly scan', '== At a glance'):
         assert part in text, part
@@ -334,3 +346,58 @@ def test_export_has_the_status_and_no_secret(hg, tmp_path, monkeypatch):
     assert data['open_problems'][0]['key'] == 'disk' and data['mails'][-1]['level'] == 'alert'
     text = target.read_text()
     assert 'abcdefghijklmnop' not in text and 'api_token' not in text and '[hidden]' in text
+
+
+def test_a_plain_server_has_no_app_checks_and_no_false_alarms(hg, monkeypatch):
+    # a VPS with no Docker app, no domain and no database: only host checks run
+    monkeypatch.setattr(hg, 'sh', lambda cmd, timeout=120, input=None: (0, ''))
+    monkeypatch.setattr(hg, 'mem_free_pct', lambda: 60)
+    monkeypatch.setattr(hg, 'disk_pct', lambda p='/': 30)
+    keys = [c[0] for c in hg.checks()]
+    assert 'containers' not in keys and 'https' not in keys and 'replication' not in keys and 'backup' not in keys
+    assert not any(bad for _, bad, _, _ in hg.checks())
+    assert hg.replication() == (None, 'not configured') and hg.dump_command() == (None, None)
+    monkeypatch.setattr(hg, 'fail2ban', lambda: {})
+    text = hg.report_text()
+    assert '== Containers' not in text and '== EdgeShell' not in text and '== Database replica' not in text
+
+
+def test_a_plain_server_backs_up_and_restore_tests_any_command(hg, tmp_path, monkeypatch):
+    import shutil as sh_
+    if not sh_.which('gpg') or not sh_.which('gzip') or not sh_.which('sh') or os.name == 'nt':
+        pytest.skip('needs gpg, gzip and a POSIX shell')
+    monkeypatch.setitem(hg.C, 'BACKUP_CMD', "printf 'hello from the app'")
+    monkeypatch.setitem(hg.C, 'BACKUP_MIN_BYTES', '1')
+    monkeypatch.setitem(hg.C, 'BACKUP_PASSPHRASE', 'test-passphrase-123')
+    monkeypatch.setitem(hg.C, 'BACKUP_DIR', str(tmp_path / 'b'))
+    monkeypatch.setenv('GNUPGHOME', str(tmp_path / 'gnupg'))
+    os.makedirs(tmp_path / 'gnupg', mode=0o700)
+    hg.backup()
+    s = hg.load()
+    assert s['backup']['name'].startswith('backup-') and s['backup']['name'].endswith('.gz.gpg')
+    hg.restore_test()
+    s = hg.load()
+    assert s['restore_test']['ok'] and 'KB after unpacking' in s['restore_test']['tables'][0]
+    assert 'Restore test passed' in hg.SENT.read_text()
+
+
+def test_a_plain_server_dump_commands_for_each_database(hg, monkeypatch):
+    monkeypatch.setitem(hg.C, 'DB_ENGINE', 'postgres')
+    assert hg.dump_command() == ('sudo -u postgres pg_dumpall', 'sql.gz')
+    monkeypatch.setitem(hg.C, 'STACK_DIR', '/srv/my app')
+    monkeypatch.setitem(hg.C, 'DB_SERVICE', 'db')
+    cmd, _ = hg.dump_command()
+    assert cmd.startswith("docker compose --project-directory '/srv/my app' exec -T db pg_dumpall")
+    monkeypatch.setitem(hg.C, 'DB_ENGINE', 'mariadb')
+    assert 'mariadb-dump' in hg.dump_command()[0]
+    monkeypatch.setitem(hg.C, 'BACKUP_CMD', 'tar -cf - /srv/data')
+    assert hg.dump_command() == ('tar -cf - /srv/data', 'gz')
+
+
+def test_every_profile_uses_only_known_settings(hg):
+    import glob as g
+    profiles = g.glob(os.path.join(HERE, '..', 'examples', 'profiles', '*.conf'))
+    assert len(profiles) >= 4
+    for p in profiles:
+        for k in hg.read_kv(p):
+            assert k in hg.DEFAULTS and k not in hg.SECRETS, f'{os.path.basename(p)}: {k}'
