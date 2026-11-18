@@ -5,3 +5,7 @@ __pycache__/
 *.db
 *.db-wal
 *.db-shm
+src/host_guard/payload/
+dist/
+build/
+*.egg-info/

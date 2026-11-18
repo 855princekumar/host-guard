@@ -1,0 +1,3 @@
+#!/bin/sh
+# The version manager, run from this checkout:  sudo ./host-guard install --mail-to you@example.com ...
+exec python3 -I "$(dirname "$0")/src/host_guard/manager.py" "$@"

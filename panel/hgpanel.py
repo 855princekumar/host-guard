@@ -228,7 +228,8 @@ main{max-width:1100px;margin:0 auto;padding:16px}h1{font-size:18px;margin:0}h2{f
 .card{background:#fff;border:1px solid #dde1e7;border-radius:8px;padding:12px;overflow:auto}
 table{border-collapse:collapse;width:100%}td,th{padding:3px 6px;text-align:left;vertical-align:top;border-bottom:1px solid #8882}
 th{color:#5b6576;font-weight:500;white-space:nowrap}.bad{color:#c62828;font-weight:600}.ok{color:#2e7d32;font-weight:600}
-form.login{max-width:340px;margin:10vh auto}label{display:block;margin:10px 0 4px}input{width:100%;padding:8px;border:1px solid #c5cbd5;border-radius:6px;font:inherit}
+form.login{max-width:340px;margin:10vh auto}label{display:block;margin:10px 0 4px}
+input{width:100%;padding:8px;border:1px solid #c5cbd5;border-radius:6px;font:inherit}
 button{margin-top:14px;padding:8px 14px;border:0;border-radius:6px;background:#2f5bd3;color:#fff;font:inherit;cursor:pointer}
 .err{color:#c62828}.muted{color:#8a94a6;font-size:13px}pre{white-space:pre-wrap;margin:0;font-size:13px}
 '''

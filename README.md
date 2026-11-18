@@ -66,10 +66,13 @@ On the server (Ubuntu 22.04 to 26.04 or Debian 12), with an SSH key that works a
 second session open:
 
 ```bash
-git clone https://github.com/855princekumar/host-guard.git && cd host-guard
-sudo bash guard/install.sh --mail-to you@gmail.com,teammate@example.com \
+sudo apt install -y pipx
+sudo PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install host-guard
+sudo host-guard install --mail-to you@gmail.com,teammate@example.com \
      --profile examples/profiles/plain-vps.conf --with-trivy
 ```
+
+(From a clone instead: `sudo ./host-guard install ...` in the repository folder.)
 
 It asks for the Gmail app password of the first address (not shown as you type),
 then sends a test mail. Copy the backup passphrase somewhere offline:
@@ -87,6 +90,20 @@ Pick the profile closest to your server, or start from `plain-vps.conf` and edit
 
 Full steps for EC2, a VPS and bare metal, other mail providers and an off-site
 S3 copy: [docs/INSTALL.md](docs/INSTALL.md).
+
+### Upgrade, roll back, remove
+
+Every install is recorded file by file in `/opt/host-guard`, so it can be undone exactly:
+
+```bash
+sudo host-guard upgrade              # same options as the install
+sudo host-guard rollback             # undo the last install (or --to 0.3.0)
+sudo host-guard uninstall            # settings, secrets and backups stay
+host-guard history
+```
+
+A failed install undoes itself; a file you edited since is kept, not overwritten;
+SSH settings are checked before they apply. [docs/VERSIONS.md](docs/VERSIONS.md).
 
 ## How it fits together
 
@@ -123,7 +140,7 @@ with scrypt plus an authenticator code, 127.0.0.1 only (reach it through
 
 | Task | Command |
 |---|---|
-| Status and open problems | `sudo hostguard status` |
+| Installed version, then status and open problems | `sudo host-guard status` |
 | The daily report now | `sudo hostguard report` |
 | Check that mail reaches everyone | `sudo hostguard test-mail` |
 | When each job runs next | `systemctl list-timers 'host-guard-*'` |
@@ -134,14 +151,20 @@ with scrypt plus an authenticator code, 127.0.0.1 only (reach it through
 ## Tests
 
 ```bash
-python -m pytest -q guard/tests panel/tests
+python -m pytest -q tests guard/tests panel/tests
 docker run --rm -v "$PWD:/src:ro" ubuntu:26.04 bash /src/ci/fresh_install.sh
+python ci/build_dist.py && docker run --rm -v "$PWD:/src:ro" -v "$PWD/dist:/dist:ro" debian:12 bash /src/ci/lifecycle.sh
 ```
 
-CI runs the tests on Python 3.12 and 3.14, a fresh install on Ubuntu 24.04, 26.04
-and Debian 12 (with a real `sshd -t`, a backup and a restore test), Bandit,
-gitleaks over the whole history, ShellCheck, `systemd-analyze verify`, a check for
-broken links in the docs and one for the em dash character.
+| CI job | What it proves |
+|---|---|
+| Tests (Python 3.10, 3.12, 3.14) | the guard, the panel and the version manager, without root |
+| Fresh install (Ubuntu 24.04, 26.04, Debian 12) | a real install, a real `sshd -t`, a rerun, a backup and a restore test |
+| Install, upgrade, rollback, uninstall (same three) | the pip package through its whole life; after `uninstall --purge` the server is byte-for-byte as before |
+| Database backups and restore tests | real MariaDB and PostgreSQL, restored into throwaway databases |
+| Package | sdist and wheel carry what runs on a server; `twine check`; VERSION matches the changelog |
+| Lint, Bandit, gitleaks, ShellCheck, systemd units | code quality, security patterns, no secret in the whole history, unit files valid |
+| Docs and text | every local link resolves; no em dash |
 
 ## Contributing and security
 

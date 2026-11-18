@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.3.0] - 2026-11-18
+
+### Added
+- **Version manager** (`host-guard`): `install`, `upgrade`, `rollback [--to VERSION]`,
+  `uninstall [--purge]`, `status`, `history`. Every install is recorded file by file in
+  `/opt/host-guard` (releases, a manifest per install, a copy of every replaced file).
+- **Rollback that cannot break the server**: a file is restored only while it holds
+  what the install wrote (an admin's later edit is kept and reported); SSH and
+  fail2ban settings are checked before they apply; a failed install undoes itself.
+- **Downgrade guard**: installing an older version over a newer one asks first
+  (`--allow-downgrade` without a terminal).
+- **Adoption**: a server installed before the manager is adopted by its first
+  upgrade; a rollback returns to exactly that setup.
+- **Saved options**: `upgrade` reuses the install options, so who may log in over SSH
+  never changes by accident; recipients come from `guard.conf`.
+- **pip package** with Trusted Publishing from a tagged release (`pipx install host-guard`).
+- CI: the pip package through install, upgrade, refused downgrade, injected failure,
+  rollback and `uninstall --purge` on Ubuntu 24.04, 26.04 and Debian 12, ending
+  byte-for-byte pristine; ruff lint; package checks.
+
+### Fixed
+- The AWS credentials message pointed at `guard.conf`; keys live in `.env`.
+
 ## [0.2.0] - 2026-11-17
 
 ### Added
