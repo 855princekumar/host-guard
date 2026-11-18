@@ -9,7 +9,8 @@ out, seconds, commit = sys.argv[1], int(sys.argv[2]), sys.argv[3]
 rows = [json.loads(line) for line in open(os.path.join(out, 'results.jsonl'), encoding='utf-8') if line.strip()]
 PHASES = [('SSH', 'SSH: initial access'), ('WEB', 'Web: probing and flooding'),
           ('HOST', 'Host: persistence, privilege, miners'), ('NET', 'Network: egress and scanning'),
-          ('BAK', 'Backups: confidentiality and integrity'), ('SEC', 'Secrets'), ('PANEL', 'Panel: web attacks')]
+          ('BAK', 'Backups: confidentiality and integrity'), ('SEC', 'Secrets'), ('GUI', 'Panel in a real browser'),
+          ('PANEL', 'Panel: web attacks (raw HTTP and a hostile page in the same browser)')]
 ICON = {'PASS': 'stopped', 'GAP': 'gap', 'FAIL': '**FAILED**'}
 n = {k: sum(r['result'] == k for r in rows) for k in ('PASS', 'GAP', 'FAIL')}
 

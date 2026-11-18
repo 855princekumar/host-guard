@@ -22,7 +22,7 @@ For anyone running a product on a single cloud instance, VPS or bare-metal box w
 
 [![Bandit](https://img.shields.io/badge/security%20lint-Bandit-yellow)](.github/workflows/ci.yml)
 [![gitleaks](https://img.shields.io/badge/secret%20scan-gitleaks-blueviolet)](.github/workflows/ci.yml)
-[![Red team](https://img.shields.io/badge/red%20team-34%20attacks%20stopped%2C%203%20gaps%20open-c0392b)](docs/REDTEAM.md)
+[![Red team](https://img.shields.io/badge/red%20team-43%20attacks%20stopped%2C%203%20gaps%20open-c0392b)](docs/REDTEAM.md)
 [![Rollback](https://img.shields.io/badge/install-manifest%20%2B%20rollback-success)](docs/VERSIONS.md)
 [![No agent](https://img.shields.io/badge/agent-none-lightgrey)](#why-host-guard)
 
@@ -64,9 +64,11 @@ security updates.
 
 ## Proven by attack
 
-Every change is attacked in CI before it can merge: 37 real attacks on an isolated
-network against a server installed by the version manager, each mapped to MITRE ATT&CK.
-**34 stopped or detected, 3 known gaps, 0 failed.**
+Every change is attacked in CI before it can merge: 46 real attacks on an isolated
+network against a server installed by the version manager, plus the dashboard attacked
+from a real browser, each mapped to MITRE ATT&CK.
+**43 stopped or detected, 3 known gaps, 0 failed.** The suite lives in
+[ci/redteam/](ci/redteam/) and runs as the `Red team` job, required for every merge and release.
 
 | Phase | Attacks | Result |
 |---|---|---|
@@ -76,11 +78,12 @@ network against a server installed by the version manager, each mapped to MITRE 
 | Network: mining-pool egress, port scan | 2 | 1 stopped, 1 gap |
 | Backups: theft, tampering of the off-site copy, restore | 4 | 4 stopped |
 | Secrets: leaks, file permissions, panel account | 3 | 3 stopped |
-| Panel: DNS rebinding, CSRF, SQL injection, cookie theft, code replay, guessing | 10 | 9 stopped, 1 gap |
+| Dashboard in a real browser: sign-in, screenshots | 2 | 2 stopped |
+| Dashboard attacks: DNS rebinding, CSRF, CORS, framing, stored XSS, SQL injection, session fixation and theft, code replay, guessing, methods, path traversal | 17 | 16 stopped, 1 gap |
 
 Known gaps, reported rather than hidden: a miner renamed like a kernel thread, run from /usr/local/bin; a port scan of 20 common ports; stolen session cookie replayed from another browser.
-The suite found and fixed four real defects on its first runs.
-[Full report, samples of the mails it sent](docs/REDTEAM.md).
+The suite found and fixed five real defects on its first runs.
+[Full report, screenshots and samples of the mails it sent](docs/REDTEAM.md).
 
 ## Runs anywhere, sets itself up
 
@@ -179,12 +182,27 @@ flowchart LR
 More diagrams (the life of an alert, a night's backup, the weekly rhythm, the
 panel's security split): [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
 
-## The panel (optional)
+## The dashboard (optional)
 
-A one-page, read-only view of the same status for one admin: password hashed
-with scrypt plus an authenticator code, 127.0.0.1 only (reach it through
-`ssh -L`), running as an unprivileged user that cannot read any secret.
-[docs/PANEL.md](docs/PANEL.md).
+One page with everything host-guard knows, for the admin: open problems, health,
+intrusion watch, bans, backups and restore tests, scans, early warning and recent mails.
+Password (scrypt) plus an authenticator code; it runs as an unprivileged user that
+cannot read any secret, and listens on `127.0.0.1` only.
+
+<p align="center">
+<img src="docs/assets/panel-signin.png" alt="The panel's sign-in page" width="40%">
+<img src="docs/assets/panel-dashboard.png" alt="The panel's dashboard" width="58%">
+</p>
+
+Install it with `--with-panel`, then open it through a tunnel, no port opened and no VPN:
+
+```bash
+ssh -N -L 8650:127.0.0.1:8650 you@your-server        # then http://127.0.0.1:8650
+```
+
+AWS SSM, Google IAP, Azure Bastion and OCI Bastion tunnels work the same way:
+[docs/PANEL.md](docs/PANEL.md#open-it). Every change is attacked in a real browser in CI
+(stored script injection, CORS, cross-site posts, framing, session fixation, guessing).
 
 ## Everyday commands
 
@@ -213,7 +231,7 @@ python ci/build_dist.py && docker run --rm -v "$PWD:/src:ro" -v "$PWD/dist:/dist
 | Install, upgrade, rollback, uninstall (same three) | the pip package through its whole life; after `uninstall --purge` the server is byte-for-byte as before |
 | Database backups and restore tests | real MariaDB and PostgreSQL, restored into throwaway databases |
 | Package | sdist and wheel carry what runs on a server; `twine check`; VERSION matches the changelog |
-| Red team | 37 real attacks on an isolated network, scored per MITRE ATT&CK; a failed defense fails CI |
+| Red team | 46 real attacks on an isolated network, scored per MITRE ATT&CK; a failed defense fails CI |
 | Clouds | AWS, Google Cloud, Azure, Oracle Cloud and bare metal detected; backups off-site to emulated stores and restore-tested; forged signatures refused |
 | CodeQL (Python, Actions) | security-extended queries on every change and weekly |
 | Lint, Bandit, gitleaks, ShellCheck, systemd units | code quality, security patterns, no secret in the whole history, unit files valid |

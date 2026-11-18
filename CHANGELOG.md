@@ -19,14 +19,21 @@
 - CI: the pip package through install, upgrade, refused downgrade, injected failure,
   rollback and `uninstall --purge` on Ubuntu 24.04, 26.04 and Debian 12, ending
   byte-for-byte pristine; ruff lint; package checks.
-- **Red team in CI** (`ci/redteam/run.sh`): 37 real attacks on an isolated network
+- **Red team in CI** (`ci/redteam/`): 46 real attacks on an isolated network
   against a server installed by the version manager, each mapped to MITRE ATT&CK and
   scored stopped, gap or failed (a failed defense fails CI): SSH brute force and policy,
   web probes and floods, root backdoor accounts, miners, persistence (keys, sudoers,
   cron, ld.so.preload), mining-pool egress, backup theft and tampering of the off-site
   copy in an emulated S3 (Floci), secret leaks, and the panel (DNS rebinding, CSRF,
-  SQL injection, cookie theft and replay, code replay, guessing). The report goes to
-  the CI summary; a sample is in [docs/REDTEAM.md](docs/REDTEAM.md).
+  SQL injection, cookie theft and replay, code replay, guessing, unusual methods, path
+  traversal), and the dashboard in a real browser (headless Chromium): sign-in, session
+  fixation, stored script injection, CORS reads, cross-site posts and framing from a hostile
+  page. The report goes to the CI summary; a sample with screenshots is in
+  [docs/REDTEAM.md](docs/REDTEAM.md).
+- **Dashboard**: a form post from another site (its `Origin`, or `Sec-Fetch-Site:
+  cross-site`) is refused and audited; screenshots and a guide to reach it through SSH,
+  AWS SSM, Google IAP, Azure Bastion or OCI Bastion, no port opened and no VPN
+  ([docs/PANEL.md](docs/PANEL.md)); `host-guard install --with-panel`.
 - **Any cloud, detected by itself**: `hostguard whereami` and the installer read the
   cloud from its own metadata service (AWS, Google Cloud, Azure, Oracle Cloud); anything
   else is a VPS or bare metal. The report names it; the cost section uses AWS prices only
