@@ -118,6 +118,7 @@ if ! has BACKUP_PASSPHRASE; then
 fi
 grep -q '^#\?EDGESHELL_KEY=' "$ENVF" || printf '# A read-only EdgeShell service key (API page, scope read) for fleet numbers in the daily report:\nEDGESHELL_KEY=\n' >> "$ENVF"
 grep -q '^#\?AWS_ACCESS_KEY_ID=' "$ENVF" || printf '# Only when the instance has no role allowed to use the backup bucket:\nAWS_ACCESS_KEY_ID=\nAWS_SECRET_ACCESS_KEY=\n' >> "$ENVF"
+grep -q '^#\?BACKUP_REMOTE_URL=' "$ENVF" || printf '# BACKUP_REMOTE=azure: a container SAS URL; BACKUP_REMOTE=oci-par: a bucket pre-authenticated request URL:\nBACKUP_REMOTE_URL=\n' >> "$ENVF"
 
 step "Mail (msmtp; the password stays in .env)"
 umask 077
@@ -181,6 +182,14 @@ else   # a rerun takes the recipients given now (both values were checked above)
   done
 fi
 chmod 600 "$CONF"
+
+step "Where this server runs"
+# The cloud is read from its own metadata service (AWS, Google Cloud, Azure, Oracle Cloud);
+# anything else is a VPS or bare metal. It is written once, so later runs do not ask again;
+# set CLOUD= (empty) in guard.conf to have it asked at every run instead.
+CLOUD_NOW="$(/usr/local/sbin/hostguard whereami --short 2>/dev/null || echo other)"
+grep -q '^CLOUD=' "$CONF" || printf 'CLOUD=%s\n' "$CLOUD_NOW" >> "$CONF"
+/usr/local/sbin/hostguard whereami 2>/dev/null | sed 's/^/  /' || echo "  not detected: treated as a VPS or bare metal"
 
 step "Kernel and network hardening (sysctl)"
 install -m 0644 "$HERE/conf/sysctl-hardening.conf" /etc/sysctl.d/99-host-guard.conf

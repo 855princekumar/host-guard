@@ -21,7 +21,8 @@ Start from a profile in [examples/profiles/](../examples/profiles/) and change w
 |---|---|
 | `SMTP_PASSWORD` | the mail account's password (a Gmail app password); msmtp reads it at send time |
 | `BACKUP_PASSPHRASE` | encrypts every backup; made at install; **keep a copy offline** |
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | only for S3 backups without an instance role |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | only for S3 backups without an instance role (also a Google Cloud HMAC key, an OCI customer secret key, R2, B2, ...) |
+| `BACKUP_REMOTE_URL` | `BACKUP_REMOTE=azure`: a container SAS URL; `oci-par`: a bucket pre-authenticated request URL ([clouds](CLOUDS.md)) |
 | `EDGESHELL_KEY` | only for EdgeShell: a read-only service key for fleet numbers in the report |
 
 ## Mail
@@ -33,6 +34,7 @@ Start from a profile in [examples/profiles/](../examples/profiles/) and change w
 | `SITE` | host name | the server's name in every subject |
 | `COOLDOWN_H` | `6` | the same open problem is mailed at most this often |
 | `NOTIFY_CMD` | `msmtp -a default` | the command that sends a mail (the message on stdin, recipients as arguments) |
+| `MAIL_MAX_PER_HOUR` | `4` | P2 and P3 mails of one category an hour; more are held and named in the next one ([mail](MAIL.md)) |
 
 ## The app on the server
 
@@ -66,7 +68,9 @@ All optional: with nothing set, host-guard guards the host itself.
 | `S3_BUCKET` | empty | with it, every backup is also uploaded, and the restore test downloads from there |
 | `S3_PREFIX` | `host-guard/` | the key prefix in the bucket |
 | `AWS_REGION` | `ap-south-1` | the bucket's region (and the price list for the cost report) |
-| `S3_ENDPOINT` | empty | an S3-compatible service's URL (B2, Wasabi, R2, MinIO) |
+| `S3_ENDPOINT` | empty | an S3-compatible service's URL (Google Cloud Storage, OCI, B2, Wasabi, R2, MinIO) |
+| `S3_CA_BUNDLE` | empty | a CA file for a store with a private certificate |
+| `BACKUP_REMOTE` | `s3` when `S3_BUCKET` is set | `s3`, `azure` or `oci-par` ([clouds](CLOUDS.md)) |
 
 What each combination does:
 
@@ -109,6 +113,12 @@ The command runs as root with `pipefail`: if it fails, the backup fails and you 
 | `KEV_URL` | CISA's Known Exploited Vulnerabilities feed |
 | `USN_URL` | Ubuntu security notices |
 | `OSV_URL`, `OSV_VULN_URL` | the OSV advisory database |
+
+## Where it runs
+
+| Key | Default | What |
+|---|---|---|
+| `CLOUD` | written at install | `aws`, `gcp`, `azure`, `oci` or `other`; empty: asked from the metadata service at every run ([clouds](CLOUDS.md)) |
 
 ## Running cost
 

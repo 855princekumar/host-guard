@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_call:      # the release runs all of it before publishing
 
 permissions:
   contents: read
@@ -13,6 +14,7 @@ jobs:
     name: Tests (Python ${{ matrix.python }})
     runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         python: ["3.10", "3.12", "3.14"]
     steps:
@@ -58,6 +60,7 @@ jobs:
     name: Fresh install (${{ matrix.os }})
     runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         os: ["ubuntu:24.04", "ubuntu:26.04", "debian:12"]
     steps:
@@ -89,6 +92,7 @@ jobs:
     needs: package
     runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         os: ["ubuntu:24.04", "ubuntu:26.04", "debian:12"]
     steps:
@@ -98,6 +102,29 @@ jobs:
           name: dist
           path: dist
       - run: docker run --rm -v "$PWD:/src:ro" -v "$PWD/dist:/dist:ro" ${{ matrix.os }} bash /src/ci/lifecycle.sh
+
+  redteam:
+    name: Red team (real attacks on an isolated network)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash ci/redteam/run.sh
+      - if: always()
+        run: cat redteam-out/REPORT.md >> "$GITHUB_STEP_SUMMARY"
+      - if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: redteam-report
+          path: redteam-out/
+
+  clouds:
+    name: Clouds (AWS, Google Cloud, Azure, Oracle Cloud, bare metal; emulated)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: bash ci/clouds/run.sh
+      - if: always()
+        run: cat clouds-out/results.md >> "$GITHUB_STEP_SUMMARY"
 
   databases:
     name: Database backups and restore tests (MariaDB, PostgreSQL)
@@ -111,9 +138,23 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
       - name: No em dash anywhere
         run: |
           if git grep -nIP '\x{2014}' -- . ':!*.png' ':!*.webp' ':!*.mp4'; then echo "em dash found (use a colon, comma or parentheses)"; exit 1; fi
+      - name: No private names (terms kept only in the FORBIDDEN_TERMS secret; skipped without it)
+        env:
+          TERMS: ${{ secrets.FORBIDDEN_TERMS }}
+        run: |
+          [ -n "$TERMS" ] || { echo "no FORBIDDEN_TERMS secret: skipped"; exit 0; }
+          hit=0
+          while IFS= read -r t; do
+            t="$(printf %s "$t" | tr -d "\r" | xargs)"; [ -n "$t" ] || continue
+            if git grep -qiIF -- "$t" -- . ; then echo "a private term is in the tree (not printed)"; hit=1; fi
+            if git log --format=%B | grep -qiF -- "$t"; then echo "a private term is in a commit message (not printed)"; hit=1; fi
+          done < <(printf %s "$TERMS" | tr "," "\n")
+          exit $hit
       - name: Every local link in the docs exists
         run: python3 ci/check_links.py
 
@@ -123,7 +164,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: |
-          files="host-guard guard/install.sh guard/conf/firewall.sh guard/conf/base-hardening.sh panel/install.sh ci/fresh_install.sh ci/db_restore.sh ci/lifecycle.sh"
+          files="host-guard guard/install.sh guard/conf/firewall.sh guard/conf/base-hardening.sh panel/install.sh ci/fresh_install.sh ci/db_restore.sh ci/lifecycle.sh ci/redteam/run.sh ci/redteam/target.sh ci/clouds/run.sh"
           for f in $files; do bash -n "$f"; done
           shellcheck -S error $files
 
