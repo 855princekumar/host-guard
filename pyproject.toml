@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "host-guard"
+dynamic = ["version"]
+description = "Hardening, monitoring, encrypted backups with restore tests and mail alerts for one Linux server, with versioned installs and manifest-based rollback."
+readme = "docs/PYPI.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Prince Kumar" }]
+keywords = ["security", "hardening", "monitoring", "backup", "fail2ban", "server", "vps", "ec2"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: System :: Systems Administration",
+    "Topic :: System :: Monitoring",
+    "Topic :: System :: Archiving :: Backup",
+]
+dependencies = []
+
+[project.scripts]
+host-guard = "host_guard.manager:main"
+
+[project.urls]
+Homepage = "https://github.com/855princekumar/host-guard"
+Changelog = "https://github.com/855princekumar/host-guard/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["host_guard*"]
+
+[tool.setuptools.package-data]
+host_guard = ["payload/**/*"]
+
+[tool.setuptools.dynamic]
+version = { file = "VERSION" }
+
+[tool.ruff]
+line-length = 140
+target-version = "py310"
+extend-exclude = ["src/host_guard/payload"]
+
+[tool.ruff.lint]
+# correctness and bug patterns; security patterns are Bandit's job (its own CI job)
+select = ["E", "F", "W", "B"]

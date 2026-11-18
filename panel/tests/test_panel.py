@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import re
+import sqlite3
 import threading
 import time
 import urllib.parse
@@ -81,7 +82,7 @@ def test_password_hash_is_scrypt_and_salted(hp):
 
 def test_only_one_admin_row_is_possible(hp):
     con = hp.db()
-    with pytest.raises(Exception):
+    with pytest.raises(sqlite3.IntegrityError):
         con.execute("INSERT INTO admin (id, username, pw_hash, totp_secret, created) VALUES (2, 'b', 'x', 'y', 0)")
 
 

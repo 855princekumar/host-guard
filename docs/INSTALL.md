@@ -23,12 +23,18 @@ provider, or a bare-metal machine.
 
 ## 1. Get host-guard onto the server
 
+From PyPI, with pipx (current Ubuntu and Debian refuse `pip install` into the system Python):
+
 ```bash
-git clone https://github.com/855princekumar/host-guard.git
-cd host-guard
+sudo apt install -y pipx
+sudo PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx install host-guard
 ```
 
-(No git? Download the release archive and unpack it, or `scp -r` the folder.)
+Or from the repository: `git clone https://github.com/855princekumar/host-guard.git && cd host-guard`,
+then use `sudo ./host-guard` wherever this page says `sudo host-guard`.
+
+`host-guard` is the version manager: it records every file each install changes,
+so an install can be [rolled back or removed](VERSIONS.md) exactly.
 
 ## 2. Choose a profile
 
@@ -50,7 +56,7 @@ health path, what to back up).
 ## 3. Install
 
 ```bash
-sudo bash guard/install.sh \
+sudo host-guard install \
   --mail-to you@gmail.com,teammate@example.com \
   --profile examples/profiles/plain-vps.conf \
   --login-user "$USER" --tz Europe/Berlin \
@@ -74,6 +80,10 @@ sudo bash guard/install.sh \
 | `--smtp-file FILE` | read the mail password from a file (deleted afterwards) instead of asking |
 | `--lockdown alert\|web` | on a critical intrusion sign only mail (default), or also stop the web server |
 | `--no-base-hardening` | leave SSH and fail2ban as they are |
+| `--with-panel`, `--panel-port N` | also install the [panel](PANEL.md) |
+
+A profile path such as `examples/profiles/plain-vps.conf` is found in the release
+itself, so it works from anywhere.
 
 The installer asks for the mail password without showing it, writes it only to
 `/etc/host-guard/.env` (root, mode 600), and finishes with a test mail to
@@ -175,21 +185,25 @@ then `sudo hostguard test-mail`.
 ## Update
 
 ```bash
-cd host-guard && git pull
-sudo bash guard/install.sh --mail-to <the same list> ...
+sudo PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin pipx upgrade host-guard   # or: git pull
+sudo host-guard upgrade
 ```
 
-The installer is idempotent: it keeps `.env`, the backup passphrase and your
-settings, and takes the recipients you give it now.
+`upgrade` reuses the options given at install and the recipients in `guard.conf`,
+keeps `.env`, the backup passphrase and your settings, and records what it changed:
+`sudo host-guard rollback` undoes it. An older version over a newer one asks first.
+[Versions and rollback](VERSIONS.md).
+
+A server installed before the manager existed is adopted by its first
+`host-guard upgrade`: a rollback then returns to exactly that setup.
 
 ## Uninstall
 
 ```bash
-sudo systemctl disable --now $(systemctl list-unit-files 'host-guard-*' --no-legend | awk '{print $1}')
-sudo rm -f /etc/systemd/system/host-guard-* /usr/local/sbin/hostguard /usr/local/sbin/host-guard-firewall \
-  /etc/sysctl.d/99-host-guard.conf /etc/apt/apt.conf.d/52host-guard-unattended
-sudo systemctl daemon-reload
-# keep or remove: /etc/host-guard (settings and secrets), /var/lib/host-guard (state),
-# /var/backups/host-guard (your backups), /etc/msmtprc,
-# /etc/ssh/sshd_config.d/01-host-guard.conf and /etc/fail2ban/jail.d/host-guard.local (the hardening)
+sudo host-guard uninstall            # timers, programs, panel; SSH, fail2ban, sysctl and mail settings as before
+sudo host-guard uninstall --purge --delete-backups   # also settings, state, backups and the packages it added
 ```
+
+Without `--purge` the settings, secrets and backups stay. `--purge` refuses while
+backups exist unless `--delete-backups` is given too, because it deletes the only
+copy of the backup passphrase.

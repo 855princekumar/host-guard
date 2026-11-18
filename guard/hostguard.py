@@ -537,7 +537,7 @@ def fail2ban():
         rc, text = sh(f'fail2ban-client status {jail}', 15)
         if rc != 0:
             continue
-        def num(label):
+        def num(label, text=text):
             m = re.search(label + r':\s*(\d+)', text)
             return int(m.group(1)) if m else 0
         m = re.search(r'Banned IP list:\s*(.*)', text)
@@ -671,8 +671,8 @@ def watch():
         action = lockdown('; '.join(c.splitlines()[0] for c in critical))
         mail('Intrusion signs on the server', '\n\n'.join(critical + alerts) + '\n\n' + action, level='critical')
     elif alerts:
-        mail('Host security alert', '\n\n'.join(alerts), key='host-' + hashlib.sha1(''.join(alerts).encode(), usedforsecurity=False).hexdigest()[:10],
-             level='alert')
+        key = 'host-' + hashlib.sha1(''.join(alerts).encode(), usedforsecurity=False).hexdigest()[:10]
+        mail('Host security alert', '\n\n'.join(alerts), key=key, level='alert')
     print(f'watch: {len(critical)} critical, {len(alerts)} alert(s)')
 
 
@@ -756,7 +756,7 @@ def feeds():
         except Exception as e:
             news.append(f'(OSV not reachable for {svc}: {str(e)[:80]})')
             continue
-        for (n, v), r in zip(sorted(pkgs.items()), res.get('results', [])):
+        for (n, v), r in zip(sorted(pkgs.items()), res.get('results', []), strict=False):
             for vul in r.get('vulns', []) or []:
                 vid = f"osv:{svc}:{n}:{vul['id']}"
                 if vid in seen:
@@ -843,7 +843,7 @@ def aws_creds():
         return c['AccessKeyId'], c['SecretAccessKey'], c['Token']
     except Exception:
         raise RuntimeError('no AWS credentials: give the instance a role, or set AWS_ACCESS_KEY_ID and '
-                           'AWS_SECRET_ACCESS_KEY in guard.conf')
+                           'AWS_SECRET_ACCESS_KEY in /etc/host-guard/.env') from None
 
 
 def s3(method, key, body=b'', extra=None):
@@ -1209,7 +1209,7 @@ def usage_stats(hours=24):
         return None
     cpus = [x['cpu'] for x in ss if x.get('cpu') is not None]
     tx = 0
-    for a, b in zip(ss, ss[1:]):
+    for a, b in zip(ss, ss[1:], strict=False):
         tx += b['tx'] - a['tx'] if b['tx'] >= a['tx'] else b['tx']        # a counter reset: a reboot
     span_h = max(1e-6, (ss[-1]['t'] - ss[0]['t']) / 3600) if len(ss) > 1 else 0
     svc = {}

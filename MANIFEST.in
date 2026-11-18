@@ -1,0 +1,4 @@
+include VERSION LICENSE docs/PYPI.md
+graft src/host_guard/payload
+prune src/host_guard/payload/guard/tests
+prune src/host_guard/payload/panel/tests
