@@ -16,6 +16,7 @@ OUT="${OUT:-$REPO/redteam-out}"
 PY="${PYTHON:-python3}"
 IMG=ubuntu:24.04
 FLOCI=floci/floci@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be71956eb7a7fce08fc21458e19
+BROWSER=mcr.microsoft.com/playwright/python@sha256:640d578aae63cfb632461d1b0aecb01414e4e020864ac3dd45a868dc0eff3078   # v1.55.0-noble
 NET=hg-redteam
 CLIENTS="attacker prober flooder auditor admin"
 START=$(date +%s)
@@ -208,8 +209,26 @@ perm=$(T 'stat -c "%a %U:%G" /etc/host-guard/.env /etc/host-guard/guard.conf /va
 record SEC-3 T1083 "File permissions of secrets, settings and the panel's status file" ".env and guard.conf 600 root; status 640 root:hgpanel" \
   "$(verdict "$([ "$(echo $perm)" = '600 root:root 600 root:root 640 root:hgpanel' ] && echo 1)")" "$perm"
 
-echo "==> Panel (reached through the tunnel)"
+echo "==> Panel in a real browser (headless Chromium in the target's network: what an admin sees through ssh -L)"
+# Script in the status data, as a log line or a name an attacker chose could carry it
+T "python3 - <<'PYEOF'
+import json, time
+a = json.load(open('/var/lib/host-guard/alerts.json'))
+a['xss-test'] = {'at': time.time(), 'subject': '<img src=x onerror=\"document.title=\\'XSS\\'\">', 'category': 'Host change'}
+json.dump(a, open('/var/lib/host-guard/alerts.json', 'w'))
+m = json.load(open('/var/lib/host-guard/mail-log.json'))
+m['sent'].append({'at': time.time(), 'subject': '<script>document.title=\\'XSS\\'</script>', 'level': 'alert'})
+json.dump(m, open('/var/lib/host-guard/mail-log.json', 'w'))
+PYEOF
+hostguard export >/dev/null"
+docker run --rm --network container:hgrt-target -v "$REPO:/src:ro" -v "$OUT:/out" -e OUT=/out "$BROWSER" \
+  sh -c 'pip install -q --no-cache-dir playwright==1.55.0 >/dev/null 2>&1 && python3 /src/ci/redteam/browser_attack.py'   > "$OUT/browser.jsonl" 2>"$OUT/browser.err" || tail -5 "$OUT/browser.err"
+grep -q '"GUI-2"' "$OUT/browser.jsonl" || record GUI-0 T1078 "The browser stage ran" "it ran" FAIL "no browser results: $(tail -1 "$OUT/browser.err" | cut -c1-150)"
+sleep 31        # a fresh authenticator step: the panel rightly refuses a code used once already
+
+echo "==> Panel (raw HTTP through the tunnel)"
 T 'python3 /src/ci/redteam/panel_attack.py' > "$OUT/panel.jsonl" 2>"$OUT/panel.err"
+cat "$OUT/browser.jsonl" >> "$OUT/panel.jsonl"
 "$PY" - "$(hp "$OUT/panel.jsonl")" "$(hp "$OUT/results.jsonl")" <<'PYEOF'
 import json, sys
 with open(sys.argv[2], 'a') as out:

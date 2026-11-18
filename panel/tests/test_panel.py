@@ -192,3 +192,27 @@ def test_a_remote_bind_needs_allow_remote(hp):
     hp.C.update({'BIND': '0.0.0.0', 'ALLOW_REMOTE': '0'})
     with pytest.raises(SystemExit):
         hp.make_server()
+
+
+def test_a_form_post_from_another_site_is_refused(hp):
+    c = Client(hp)
+    assert c.login().status == 303
+    token = re.search(r'name="csrf" value="([^"]+)"', c.req('GET', '/').text).group(1)
+    assert c.req('POST', '/logout', {'csrf': token}, {'Origin': 'https://evil.example'}).status == 403
+    assert c.req('POST', '/logout', {'csrf': token}, {'Sec-Fetch-Site': 'cross-site'}).status == 403
+    assert 'Sign out' in c.req('GET', '/').text                                  # still signed in
+    con = hp.db()
+    assert con.execute("SELECT COUNT(*) FROM audit WHERE event = 'cross-site post'").fetchone()[0] == 2
+    assert c.req('POST', '/logout', {'csrf': token}, {'Origin': f'http://127.0.0.1:{hp.C["PORT"]}',
+                                                      'Sec-Fetch-Site': 'same-origin'}).status == 303
+
+
+def test_a_browser_sending_origin_null_is_judged_by_sec_fetch_site(hp):
+    """Chrome sends Origin: null on a same-origin form post under Referrer-Policy: no-referrer
+    (found by the red team's browser stage: the admin could not sign in)."""
+    c = Client(hp)
+    assert c.login().status == 303
+    token = re.search(r'name="csrf" value="([^"]+)"', c.req('GET', '/').text).group(1)
+    assert c.req('POST', '/logout', {'csrf': token}, {'Origin': 'null'}).status == 403            # no proof
+    assert c.req('POST', '/logout', {'csrf': token}, {'Origin': 'null', 'Sec-Fetch-Site': 'same-site'}).status == 403
+    assert c.req('POST', '/logout', {'csrf': token}, {'Origin': 'null', 'Sec-Fetch-Site': 'same-origin'}).status == 303

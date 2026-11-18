@@ -410,9 +410,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             con.close()
 
+    def same_origin(self):
+        """A form post must come from the panel's own page: a browser names the page's origin
+        (Origin) and whether it is another site (Sec-Fetch-Site). Either one pointing elsewhere is
+        refused, on top of the form token and the SameSite=Strict cookie."""
+        site = self.headers.get('Sec-Fetch-Site')
+        if site and site not in ('same-origin', 'none'):
+            return False
+        origin = self.headers.get('Origin')
+        if origin is None:
+            return True                                    # not sent by every client; the form token still is
+        if origin == 'null':                               # what browsers send under Referrer-Policy: no-referrer;
+            return site == 'same-origin'                   # then the browser's own Sec-Fetch-Site decides
+        return urllib.parse.urlsplit(origin).netloc.lower() in allowed_hosts()
+
     def do_POST(self):
         if not self.host_ok():
             return self.send(400, b'bad host', 'text/plain')
+        if not self.same_origin():
+            con = db()
+            try:
+                audit(con, self.ip(), 'cross-site post', (self.headers.get('Origin') or '')[:80])
+            finally:
+                con.close()
+            return self.send(403, b'cross-site request refused', 'text/plain')
         route = urllib.parse.urlsplit(self.path).path
         f = self.form()
         if f is None:

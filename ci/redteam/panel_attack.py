@@ -116,6 +116,23 @@ check('PANEL-8', 'T1550.004', 'Reuse of a session cookie after sign-out', 'sessi
 st, tok, raw, body = login(code=used_code)
 check('PANEL-9', 'T1111', 'Replay of an authenticator code already used', 'refused', not tok, f'HTTP {st}')
 
+codes, cors = {}, []
+for m in ('PUT', 'DELETE', 'PATCH', 'TRACE', 'OPTIONS'):
+    st, hdr, _ = req(m, '/', headers={'Origin': 'https://evil.example', 'Access-Control-Request-Method': 'POST'})
+    codes[m] = st
+    cors += [k for k, _ in hdr if k.lower().startswith('access-control-')]
+check('PANEL-16', 'T1190', 'Unusual methods and a CORS preflight from another origin (PUT, DELETE, PATCH, TRACE, OPTIONS)',
+      'none succeeds; no CORS header ever sent', all(c >= 400 for c in codes.values()) and not cors,
+      f'answers: {codes}; CORS headers: {cors or "none"}')
+leaked = []
+for path in ('/../../etc/passwd', '/%2e%2e/%2e%2e/etc/passwd', '/style.css/../../../etc/shadow', '//etc/passwd',
+             '/static/..%2f..%2fetc%2fpasswd'):
+    st, _, body = req('GET', path)
+    if 'root:' in body:
+        leaked.append(path)
+check('PANEL-17', 'T1083', 'Path traversal to /etc/passwd and /etc/shadow (5 encodings)', 'no file served',
+      not leaked, f'files served: {leaked or "none"}')
+
 results = [login(password=f'guess-{i}')[0] for i in range(5)]
 time.sleep(1)
 st, tok, raw, body = login(code=totp(int(time.time() // 30) + 1))
