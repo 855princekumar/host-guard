@@ -11,20 +11,22 @@ For anyone running a product on a single cloud instance, VPS or bare-metal box w
 
 [![CI](https://github.com/855princekumar/host-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/855princekumar/host-guard/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.2.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.3.0-blue)](CHANGELOG.md)
+[![CodeQL](https://github.com/855princekumar/host-guard/actions/workflows/codeql.yml/badge.svg)](https://github.com/855princekumar/host-guard/actions/workflows/codeql.yml)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](CONTRIBUTING.md)
 
 [![Python](https://img.shields.io/badge/python-3.10%2B%2C%20standard%20library%20only-3776AB?logo=python&logoColor=white)](guard/hostguard.py)
 [![systemd](https://img.shields.io/badge/runs%20on-systemd%20timers-30D475?logo=linux&logoColor=white)](guard/systemd/)
 [![Ubuntu | Debian](https://img.shields.io/badge/OS-Ubuntu%2022.04%20to%2026.04%20%7C%20Debian%2012-E95420?logo=ubuntu&logoColor=white)](docs/INSTALL.md)
-[![Anywhere](https://img.shields.io/badge/hosts-EC2%20%7C%20any%20VPS%20%7C%20bare%20metal-0f172a)](docs/INSTALL.md)
+[![Anywhere](https://img.shields.io/badge/runs%20on-AWS%20%7C%20Google%20Cloud%20%7C%20Azure%20%7C%20Oracle%20%7C%20VPS%20%7C%20bare%20metal-0f172a)](docs/CLOUDS.md)
 
 [![Bandit](https://img.shields.io/badge/security%20lint-Bandit-yellow)](.github/workflows/ci.yml)
 [![gitleaks](https://img.shields.io/badge/secret%20scan-gitleaks-blueviolet)](.github/workflows/ci.yml)
-[![Fresh installs tested](https://img.shields.io/badge/fresh%20install-tested%20in%20CI-success)](ci/fresh_install.sh)
+[![Red team](https://img.shields.io/badge/red%20team-34%20attacks%20stopped%2C%203%20gaps%20open-c0392b)](docs/REDTEAM.md)
+[![Rollback](https://img.shields.io/badge/install-manifest%20%2B%20rollback-success)](docs/VERSIONS.md)
 [![No agent](https://img.shields.io/badge/agent-none-lightgrey)](#why-host-guard)
 
-[Install](docs/INSTALL.md) · [How it works](docs/HOW-IT-WORKS.md) · [Configuration](docs/CONFIGURATION.md) · [Running cost](docs/COST.md) · [Panel](docs/PANEL.md) · [Security](SECURITY.md)
+[Install](docs/INSTALL.md) · [Versions and rollback](docs/VERSIONS.md) · [How it works](docs/HOW-IT-WORKS.md) · [Clouds](docs/CLOUDS.md) · [Mail](docs/MAIL.md) · [Red team](docs/REDTEAM.md) · [Configuration](docs/CONFIGURATION.md) · [Running cost](docs/COST.md) · [Panel](docs/PANEL.md) · [Releasing](docs/RELEASING.md) · [Security](SECURITY.md)
 
 </div>
 
@@ -59,6 +61,54 @@ On install it also hardens the base: SSH by key only for one user, fail2ban for
 SSH and repeat offenders (and for sign-in floods and probes when you give it the
 web logs), kernel network settings, outbound mining ports blocked, automatic
 security updates.
+
+## Proven by attack
+
+Every change is attacked in CI before it can merge: 37 real attacks on an isolated
+network against a server installed by the version manager, each mapped to MITRE ATT&CK.
+**34 stopped or detected, 3 known gaps, 0 failed.**
+
+| Phase | Attacks | Result |
+|---|---|---|
+| SSH: brute force, password, root, wrong user | 6 | 6 stopped |
+| Web: probes for secrets, request floods | 3 | 3 stopped |
+| Host: root backdoor, miners, SSH keys, sudoers, cron, preload | 9 | 8 stopped, 1 gap |
+| Network: mining-pool egress, port scan | 2 | 1 stopped, 1 gap |
+| Backups: theft, tampering of the off-site copy, restore | 4 | 4 stopped |
+| Secrets: leaks, file permissions, panel account | 3 | 3 stopped |
+| Panel: DNS rebinding, CSRF, SQL injection, cookie theft, code replay, guessing | 10 | 9 stopped, 1 gap |
+
+Known gaps, reported rather than hidden: a miner renamed like a kernel thread, run from /usr/local/bin; a port scan of 20 common ports; stolen session cookie replayed from another browser.
+The suite found and fixed four real defects on its first runs.
+[Full report, samples of the mails it sent](docs/REDTEAM.md).
+
+## Runs anywhere, sets itself up
+
+The cloud is read from its own metadata service; anything else is a VPS or bare metal.
+The installer records it and adapts: the off-site store that fits, the cost estimate
+(AWS prices only on AWS), the usual login user.
+
+| | AWS | Google Cloud | Azure | Oracle Cloud | VPS or bare metal |
+|---|---|---|---|---|---|
+| Detected by | IMDSv2 | `Metadata-Flavor: Google` | `Metadata: true` | `Bearer Oracle` | no metadata service |
+| Off-site copy | S3 | Cloud Storage (S3 interop) | Blob (SAS URL) | Object Storage (pre-authenticated URL or S3 API) | any S3-compatible store |
+| Tested in CI with | Floci, AWS Emulator | Floci GCP | Azurite, Floci Azure | Floci OCI | |
+
+[docs/CLOUDS.md](docs/CLOUDS.md).
+
+## Mail that sorts itself
+
+```
+[P1 Critical]  Intrusion    | web-01 | Intrusion signs on the server
+[P2 Attention] Attack       | web-01 | Blocked 3 address(es)
+[P3 Info]      Backup       | web-01 | Restore test passed
+[Daily]        Daily report | web-01 | Daily report: all good
+```
+
+Severity, then category, then server, in every subject, plus `List-Id` and
+`X-Host-Guard-*` headers for filters. P1 always goes out at once; similar P2 and P3
+mails are capped per hour, so an attack does not bury the inbox.
+[docs/MAIL.md](docs/MAIL.md).
 
 ## Quick start
 
@@ -163,6 +213,9 @@ python ci/build_dist.py && docker run --rm -v "$PWD:/src:ro" -v "$PWD/dist:/dist
 | Install, upgrade, rollback, uninstall (same three) | the pip package through its whole life; after `uninstall --purge` the server is byte-for-byte as before |
 | Database backups and restore tests | real MariaDB and PostgreSQL, restored into throwaway databases |
 | Package | sdist and wheel carry what runs on a server; `twine check`; VERSION matches the changelog |
+| Red team | 37 real attacks on an isolated network, scored per MITRE ATT&CK; a failed defense fails CI |
+| Clouds | AWS, Google Cloud, Azure, Oracle Cloud and bare metal detected; backups off-site to emulated stores and restore-tested; forged signatures refused |
+| CodeQL (Python, Actions) | security-extended queries on every change and weekly |
 | Lint, Bandit, gitleaks, ShellCheck, systemd units | code quality, security patterns, no secret in the whole history, unit files valid |
 | Docs and text | every local link resolves; no em dash |
 

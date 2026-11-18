@@ -9,3 +9,6 @@ src/host_guard/payload/
 dist/
 build/
 *.egg-info/
+redteam-out/
+clouds-out/
+redteam-run*.log

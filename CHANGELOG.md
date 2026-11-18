@@ -19,8 +19,54 @@
 - CI: the pip package through install, upgrade, refused downgrade, injected failure,
   rollback and `uninstall --purge` on Ubuntu 24.04, 26.04 and Debian 12, ending
   byte-for-byte pristine; ruff lint; package checks.
+- **Red team in CI** (`ci/redteam/run.sh`): 37 real attacks on an isolated network
+  against a server installed by the version manager, each mapped to MITRE ATT&CK and
+  scored stopped, gap or failed (a failed defense fails CI): SSH brute force and policy,
+  web probes and floods, root backdoor accounts, miners, persistence (keys, sudoers,
+  cron, ld.so.preload), mining-pool egress, backup theft and tampering of the off-site
+  copy in an emulated S3 (Floci), secret leaks, and the panel (DNS rebinding, CSRF,
+  SQL injection, cookie theft and replay, code replay, guessing). The report goes to
+  the CI summary; a sample is in [docs/REDTEAM.md](docs/REDTEAM.md).
+- **Any cloud, detected by itself**: `hostguard whereami` and the installer read the
+  cloud from its own metadata service (AWS, Google Cloud, Azure, Oracle Cloud); anything
+  else is a VPS or bare metal. The report names it; the cost section uses AWS prices only
+  on AWS and otherwise says which setting gives an estimate. Detection never stops anything.
+- **Off-site copies on every cloud**: `BACKUP_REMOTE=s3` (AWS, Google Cloud Storage through
+  S3 interoperability, OCI's S3 compatibility API, R2, B2, Wasabi, MinIO), `azure` (a
+  container SAS URL) and `oci-par` (a bucket pre-authenticated request URL); uploads are
+  confirmed by every size and MD5 the store reports; `S3_CA_BUNDLE` for a private CA.
+- **Mail that sorts itself**: every subject is `[P1 Critical] Intrusion | server | what`
+  (severity P1, P2, P3, Resolved or Daily; ten fixed categories), with `List-Id`,
+  `X-Host-Guard-Severity` and `X-Host-Guard-Category` headers for filters and high
+  importance on P1. Flood protection: P2 and P3 mails of one category are capped at
+  `MAIL_MAX_PER_HOUR` (4); the rest are named in the next one and counted in the daily
+  report. P1 is never held. [docs/MAIL.md](docs/MAIL.md).
+- **Cloud CI** (`ci/clouds/run.sh`): on AWS, Google Cloud, Azure, Oracle Cloud and bare
+  metal (metadata answered like each cloud's), a real backup goes off-site to an emulated
+  store (Floci for all four clouds, Azurite, and AWS's own AWS Emulator with real SigV4
+  checks over HTTPS) and is restore-tested; forged Azure signatures and wrong AWS secrets
+  must be refused.
+- **Release gates**: a tag publishes to PyPI only after the whole CI (red team and clouds
+  included), CodeQL, and a security audit report for that version with no open confirmed
+  finding ([docs/RELEASING.md](docs/RELEASING.md)). CodeQL, secret scanning with push
+  protection, Dependabot alerts and private vulnerability reporting are on.
 
 ### Fixed
+- **A root login check mailed a false critical alert** (found by the red team): with
+  `/etc/ld.so.preload` pointing at a missing library, loader warnings mention "from
+  /etc/ld.so.preload", which was read as a login address. Only sshd's "Accepted ... for
+  root from ADDRESS" lines with a public address count now.
+- An unreachable S3 store or a refused TLS certificate crashed the backup instead of
+  mailing "upload failed".
+- **A second root account made the watch kill every root process** (found by the red
+  team): `pkill -u NAME` on a UID 0 account matches root itself, so sshd, Docker, the
+  web server and host-guard died, and no mail went out. Now the account is locked and
+  only its own SSH logins end.
+- **The `web-probe` jail never banned** (found by the red team): fail2ban cuts the time
+  stamp out of a line before matching and leaves `[]`, which the filter did not accept.
+- Rollback and uninstall stopped when fail2ban rejected the restored settings (stock
+  fail2ban on Debian 12 does, without rsyslog). Now only an SSH settings failure stops
+  them; a fail2ban failure is a warning that says what to do.
 - The AWS credentials message pointed at `guard.conf`; keys live in `.env`.
 
 ## [0.2.0] - 2026-11-17

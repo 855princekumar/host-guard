@@ -109,7 +109,8 @@ if [ -n "$WEB_LOGS" ]; then
   cat > /etc/fail2ban/filter.d/web-probe.conf <<'EOF'
 # Requests for files that a normal visitor never asks for.
 [Definition]
-failregex = ^<HOST> \S+ \S+ \[[^\]]+\] "(GET|POST|HEAD|PUT) /[^"]*(\.env|\.git/|\.aws/|\.ssh/|wp-login|wp-admin|xmlrpc\.php|phpmyadmin|/cgi-bin/|/vendor/phpunit|/actuator|/solr/|/boaform|/HNAP1)[^"]*" (400|401|403|404|405|444)
+# fail2ban cuts the time stamp out of the line before matching: the brackets are left empty.
+failregex = ^<HOST> \S+ \S+ \[[^\]]*\] "(GET|POST|HEAD|PUT) /[^"]*(\.env|\.git/|\.aws/|\.ssh/|wp-login|wp-admin|xmlrpc\.php|phpmyadmin|/cgi-bin/|/vendor/phpunit|/actuator|/solr/|/boaform|/HNAP1)[^"]*" (400|401|403|404|405|444)
 ignoreregex =
 EOF
   chain=""

@@ -255,11 +255,21 @@ def test_a_failed_check_reverts_the_rollback(hg, monkeypatch):
     install(hg, '0.3.0', '--mail-to', 'a@example.com', '--login-user', 'ops')
     hg.use('0.3.1')
     hg.main(['upgrade'])
-    monkeypatch.setattr(hg, 'checks', lambda paths: ['sshd -t rejected the SSH settings'])
+    monkeypatch.setattr(hg, 'checks', lambda paths: (['sshd -t rejected the SSH settings'], []))
     assert hg.main(['rollback', '--yes']) == 1
     assert state(hg)['version'] == '0.3.1'
     assert read(hg, '/etc/ssh/sshd_config.d/01-host-guard.conf') == 'policy 0.3.1\n'
     assert read(hg, '/etc/msmtprc') == 'mail 0.3.1\n'
+
+
+def test_a_fail2ban_warning_does_not_stop_a_rollback(hg, monkeypatch, capsys):
+    install(hg, '0.3.0', '--mail-to', 'a@example.com', '--login-user', 'ops')
+    hg.use('0.3.1')
+    hg.main(['upgrade'])
+    monkeypatch.setattr(hg, 'checks', lambda paths: ([], ['fail2ban will not start with these settings']))
+    assert hg.main(['rollback', '--yes']) == 0
+    assert state(hg)['version'] == '0.3.0'
+    assert 'WARNING: fail2ban will not start' in capsys.readouterr().out
 
 
 def test_uninstall_puts_the_server_back(hg):

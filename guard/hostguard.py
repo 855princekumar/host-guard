@@ -45,6 +45,7 @@ import glob
 import gzip
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -72,6 +73,13 @@ DEFAULTS = {
     'BACKUP_DIR': '/var/backups/host-guard', 'BACKUP_KEEP': '3', 'BACKUP_PASSPHRASE': '',
     'ENV_FILE': '/etc/host-guard/.env',
     'BACKUP_MAX_AGE_H': '26', 'S3_BUCKET': '', 'S3_PREFIX': 'host-guard/', 'S3_ENDPOINT': '', 'AWS_REGION': 'ap-south-1',
+    # off-site copies: s3 (AWS, Google Cloud Storage with HMAC keys, OCI's S3 compatibility API, R2, B2,
+    # Wasabi, MinIO), azure (a container SAS URL) or oci-par (a bucket pre-authenticated request URL);
+    # empty: s3 when S3_BUCKET is set. The URL of azure and oci-par is a secret: BACKUP_REMOTE_URL in .env.
+    'BACKUP_REMOTE': '',
+    'MAIL_MAX_PER_HOUR': '4',       # P2 and P3 mails of one category an hour; more are held (P1 never is)
+    'S3_CA_BUNDLE': '',             # a CA file for an S3 store with a private certificate (self-hosted MinIO, ...)
+    'CLOUD': '',                    # aws | gcp | azure | oci | other; empty: asked from the metadata service
     'AWS_ACCESS_KEY_ID': '', 'AWS_SECRET_ACCESS_KEY': '',
     'JAILS': 'sshd recidive nginx-limit-req web-probe edgeshell-probe',
     'LOCKDOWN': 'alert',            # alert | web (stop nginx on a critical intrusion sign)
@@ -87,7 +95,8 @@ DEFAULTS = {
     'PRICE_HOUR': '', 'PRICE_EBS_GB_MONTH': '0.0912', 'PRICE_EGRESS_GB': '0.1093', 'PRICE_IPV4_HOUR': '0.005',
     'PRICE_S3_GB_MONTH': '0.025',
 }
-SECRETS = ('SMTP_PASSWORD', 'BACKUP_PASSPHRASE', 'EDGESHELL_KEY', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY')
+SECRETS = ('SMTP_PASSWORD', 'BACKUP_PASSPHRASE', 'EDGESHELL_KEY', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY',
+           'BACKUP_REMOTE_URL')
 REGIONS = {'ap-south-1': 'Asia Pacific (Mumbai)', 'ap-south-2': 'Asia Pacific (Hyderabad)',
            'ap-southeast-1': 'Asia Pacific (Singapore)', 'us-east-1': 'US East (N. Virginia)',
            'us-west-2': 'US West (Oregon)', 'eu-west-1': 'EU (Ireland)', 'eu-central-1': 'EU (Frankfurt)'}
@@ -315,37 +324,88 @@ def mail_html(subject, body, level, footer):
             '</div></div></body></html>')
 
 
-def mail(subject, body, key=None, level='info'):
+SEVERITY = {'critical': ('P1', 'Critical'), 'alert': ('P2', 'Attention'), 'info': ('P3', 'Info'),
+            'resolved': ('', 'Resolved'), 'daily': ('', 'Daily')}
+CATEGORIES = ('Intrusion', 'Attack', 'Host change', 'Advisory', 'Backup', 'Health', 'Updates', 'Scan', 'Daily report',
+              'Test')
+# Never held by flood protection: signs of someone on the server. Holding them would let an
+# intruder bury the alert that matters under a few noisy ones (red-team HOST-9).
+NEVER_HELD = ('Intrusion', 'Host change', 'Daily report', 'Test')
+KEY_CATEGORY = {'memory': 'Health', 'disk': 'Health', 'containers': 'Health', 'https': 'Health', 'cert': 'Health',
+                'replication': 'Health', 'backup': 'Backup', 'backup-upload': 'Backup', 'backup-failed': 'Backup',
+                'reboot': 'Updates'}
+
+
+def mail_subject(subject, level, category):
+    """[P1 Critical] Intrusion | web-01 | what happened. The same three parts in every mail, so an
+    inbox can sort and filter by severity, then category, then server."""
+    code, word = SEVERITY.get(level, SEVERITY['info'])
+    return f'[{code + " " if code else ""}{word}] {category} | {C["SITE"]} | {subject}'
+
+
+def _held(log, category):
+    hour = now() - 3600
+    return [h for h in log.get('held', []) if h['category'] == category and h['at'] > hour]
+
+
+def mail(subject, body, key=None, level='info', category=None):
     """Send one mail. With a key, the same problem mails at most once per COOLDOWN_H
-    hours; resolved() clears it. Returns True when a mail went out."""
+    hours; resolved() clears it. P2 and P3 mails of one category are limited to
+    MAIL_MAX_PER_HOUR an hour: the rest are held, named in the next mail of that category
+    and in the daily report. P1 (critical), resolved and daily mails always go out.
+    Returns True when a mail went out."""
+    category = category or KEY_CATEGORY.get((key or '').split(':')[0]) or 'Health'
     alerts = load('alerts.json')
     if key:
         last = alerts.get(key, {}).get('at', 0)
         if now() - last < float(C['COOLDOWN_H']) * 3600:
             return False
-        alerts[key] = {'at': now(), 'subject': subject}
+        alerts[key] = {'at': now(), 'subject': subject, 'category': category, 'level': level}
         save(alerts, 'alerts.json')
-    tag = {'critical': '[CRITICAL] ', 'alert': '[ALERT] ', 'resolved': '[RESOLVED] '}.get(level, '')
+    subject = re.sub(r'[\r\n]+', ' ', subject)                     # never a second header
+    log = load('mail-log.json')
+    if level in ('alert', 'info') and category not in NEVER_HELD:
+        recent = [m for m in log.get('sent', []) if m.get('category') == category and m['at'] > now() - 3600
+                  and m.get('level') in ('alert', 'info')]
+        if len(recent) >= int(C['MAIL_MAX_PER_HOUR']):
+            entry = {'at': now(), 'subject': subject, 'category': category, 'level': level}
+            log.setdefault('held', []).append(entry)
+            log['held'] = log['held'][-500:]
+            log.setdefault('held_log', []).append(entry)          # kept for the daily report
+            log['held_log'] = log['held_log'][-500:]
+            save(log, 'mail-log.json')
+            print(f'(held: {category} already mailed {len(recent)} times this hour) {subject}')
+            return False
+    held = _held(log, category)
+    if held:
+        body += (f'\n\n== Held back in the last hour ({len(held)} similar mail(s), flood protection)\n'
+                 + '\n'.join(f'  {stamp(h["at"])[11:16]}  {h["subject"]}' for h in held[-20:]))
+        log['held'] = [h for h in log.get('held', []) if h not in held]
+    full = mail_subject(subject, level, category)
     rcpts = recipients()
     to = ', '.join(rcpts)
     frm = C['MAIL_FROM'] or (rcpts[0] if rcpts else '')
-    subject = re.sub(r'[\r\n]+', ' ', subject)                     # never a second header
     footer = f'host-guard on {C["SITE"]}{" | " + C["SITE_URL"] if C["SITE_URL"] else ""} | {stamp()}'
     text = '\n'.join(line[:900] for line in f'{body}\n\n-- \n{footer}\n'.splitlines()) + '\n'
-    page = base64.encodebytes(mail_html(subject, body, level, footer).encode()).decode()
+    page = base64.encodebytes(mail_html(full, body, level, footer).encode()).decode()
     bnd = 'hg-' + hashlib.sha256(f'{now()}{subject}'.encode()).hexdigest()[:24]
-    msg = (f'To: {to}\nFrom: host-guard {C["SITE"]} <{frm}>\nSubject: {tag}[{C["SITE"]}] {subject}\n'
+    code, word = SEVERITY.get(level, SEVERITY['info'])
+    slug = re.sub(r'[^a-z0-9]+', '-', category.lower()).strip('-')
+    site = re.sub(r'[^A-Za-z0-9.-]+', '-', C['SITE']).strip('-') or 'server'
+    urgent = 'X-Priority: 1\nImportance: high\n' if level == 'critical' else ''
+    msg = (f'To: {to}\nFrom: host-guard {C["SITE"]} <{frm}>\nSubject: {full}\n'
            f'Date: {dt.datetime.now(dt.timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")}\n'
+           f'List-Id: host-guard {category} <{slug}.{site}.host-guard>\n'
+           f'X-Host-Guard-Severity: {code or word}\nX-Host-Guard-Category: {category}\n{urgent}'
            f'MIME-Version: 1.0\nContent-Type: multipart/alternative; boundary="{bnd}"\n\n'
            f'--{bnd}\nContent-Type: text/plain; charset=UTF-8\nContent-Transfer-Encoding: 8bit\n\n{text}\n'
            f'--{bnd}\nContent-Type: text/html; charset=UTF-8\nContent-Transfer-Encoding: base64\n\n{page}\n'
            f'--{bnd}--\n')
-    log = load('mail-log.json')
-    log.setdefault('sent', []).append({'at': now(), 'subject': f'{tag}{subject}', 'level': level})
+    log.setdefault('sent', []).append({'at': now(), 'subject': full, 'level': level, 'category': category})
     log['sent'] = log['sent'][-200:]
     save(log, 'mail-log.json')
     if not rcpts:
-        print(f'(no MAIL_TO) {tag}{subject}\n{body}')
+        print(f'(no MAIL_TO) {full}\n{body}')
         return False
     rc, text = sh(f'{C["NOTIFY_CMD"]} ' + ' '.join(shlex.quote(a) for a in rcpts), input=msg, timeout=60)
     if rc != 0:
@@ -356,9 +416,9 @@ def mail(subject, body, key=None, level='info'):
 def resolved(key, subject, body=''):
     alerts = load('alerts.json')
     if key in alerts:
-        alerts.pop(key)
+        old = alerts.pop(key)
         save(alerts, 'alerts.json')
-        mail(subject, body or 'Back to normal.', level='resolved')
+        mail(subject, body or 'Back to normal.', level='resolved', category=old.get('category'))
 
 
 # ---------------------------------------------------------------- the Docker Compose app (optional)
@@ -511,7 +571,7 @@ def health():
     for key, bad, subject, body in checks():
         if bad:
             problems += 1
-            mail(subject, body, key=key, level='alert')
+            mail(subject, body, key=key, level='alert', category=KEY_CATEGORY.get(key, 'Health'))
         else:
             resolved(key, {'memory': 'Memory back to normal', 'disk': 'Disk back under the limit',
                            'containers': 'Every container running again', 'https': f'{C["APP_NAME"]} answering again',
@@ -569,7 +629,7 @@ def new_bans(jails=None):
     save(s)
     if fresh:
         lines = [f'{ip}: {WHY.get(j, j)} ({j})' for j, ips in fresh.items() for ip in ips]
-        mail(f'Blocked {len(lines)} address(es)', '\n'.join(lines[:50]) +
+        mail(f'Blocked {len(lines)} address(es)', category='Attack', body= '\n'.join(lines[:50]) +
              '\n\nUnban one: sudo fail2ban-client set <jail> unbanip <address>',
              key='ban-' + hashlib.sha1(''.join(lines).encode(), usedforsecurity=False).hexdigest()[:8], level='alert')
     return fresh
@@ -605,16 +665,77 @@ def lockdown(reason):
     return 'LOCKDOWN is "alert": nothing stopped. Investigate now.'
 
 
+PASSWD, PROC = '/etc/passwd', '/proc'
+CGNAT = ipaddress.ip_network('100.64.0.0/10')          # Tailscale and carrier NAT: not the internet
+
+
+def root_logins_from_internet(journal):
+    """Addresses of root SSH logins from public addresses, from sshd's "Accepted ... for root
+    from ADDRESS" lines only. Anything else in the text (a loader warning while
+    /etc/ld.so.preload points at a missing library mentions "from /etc/ld.so.preload") is
+    not a login."""
+    found = []
+    for m in re.finditer(r'Accepted \S+ for root from (\S+) port \d+', journal):
+        try:
+            ip = ipaddress.ip_address(m.group(1))
+        except ValueError:
+            continue
+        if not (ip.is_private or ip.is_loopback or ip.is_link_local or ip in CGNAT):
+            found.append(str(ip))
+    return found
+
+
+def end_sessions(name):
+    """End the SSH logins of one account, found by sshd's process title ("sshd: NAME@pts/0",
+    "sshd-session: NAME [priv]"). Never by user ID: a second UID 0 account shares root's ID,
+    and killing by it would kill every root process on the server (sshd, Docker, the web
+    server, this program). Returns the process IDs ended."""
+    title = re.compile(r'^sshd(-session)?: ' + re.escape(name) + r'(@|\s|$)')
+    ended = []
+    for pid in filter(str.isdigit, os.listdir(PROC)):
+        try:
+            with open(os.path.join(PROC, pid, 'cmdline'), 'rb') as f:
+                cmd = f.read().replace(b'\0', b' ').decode(errors='replace').strip()
+        except OSError:
+            continue
+        if title.match(cmd):
+            sh(f'kill -9 {pid}')
+            ended.append(int(pid))
+    return ended
+
+
+WATCH_LABELS = (('New account that can log in: ', 'New login account'), ('SSH key(s) added', 'SSH key added'),
+                ('A program runs from a temporary folder', 'Program running from a temporary folder'),
+                ('Security-relevant files changed', 'Security files changed'))
+
+
+def watch_subject(alerts):
+    """What the watch found, in the subject: 'New login account: support; SSH key added'."""
+    parts = []
+    for a in alerts:
+        for start, label in WATCH_LABELS:
+            if a.startswith(start):
+                m = re.match(r'New account that can log in: "([^"]+)"', a)
+                parts.append(f'{label}: {m.group(1)}' if m else label)
+                break
+        else:
+            parts.append(a.splitlines()[0][:60])
+    return '; '.join(dict.fromkeys(parts))[:150] or 'Host security alert'
+
+
 def watch():
     s = load()
     critical, alerts = [], []
     if s.get('lockdown') and C['LOCKDOWN'] == 'web':
         compose('stop nginx')                                 # keep it stopped across restarts
-    passwd = [line.split(':') for line in open('/etc/passwd').read().splitlines() if line.count(':') >= 6]
+    with open(PASSWD, encoding='utf-8', errors='replace') as f:
+        passwd = [line.split(':') for line in f.read().splitlines() if line.count(':') >= 6]
     for p in passwd:
         if p[2] == '0' and p[0] != 'root':
-            sh(f'usermod -L -e 1 {p[0]}; pkill -KILL -u {p[0]}')
-            critical.append(f'Extra root (UID 0) account "{p[0]}": locked and its processes killed')
+            sh(f'usermod -L -e 1 {shlex.quote(p[0])}')
+            ended = end_sessions(p[0])
+            critical.append(f'Extra root (UID 0) account "{p[0]}": locked; '
+                            + (f'{len(ended)} of its SSH login process(es) ended' if ended else 'no open login of it'))
     logins = sorted(p[0] for p in passwd if not p[6].endswith(('nologin', 'false', 'sync')) and p[0] != 'root')
     known = s.setdefault('logins', logins)
     for u in sorted(set(logins) - set(known)):
@@ -624,17 +745,17 @@ def watch():
         critical.append('/etc/ld.so.preload is set (a classic rootkit technique):\n' + open('/etc/ld.so.preload').read()[:300])
     qdir = path('quarantine')
     os.makedirs(qdir, exist_ok=True)
-    for pid in filter(str.isdigit, os.listdir('/proc')):
+    for pid in filter(str.isdigit, os.listdir(PROC)):
         try:
-            exe = os.readlink(f'/proc/{pid}/exe')
-            comm = open(f'/proc/{pid}/comm').read().strip()
-            cmd = open(f'/proc/{pid}/cmdline', 'rb').read().replace(b'\0', b' ').decode(errors='replace')[:200]
+            exe = os.readlink(f'{PROC}/{pid}/exe')
+            comm = open(f'{PROC}/{pid}/comm').read().strip()
+            cmd = open(f'{PROC}/{pid}/cmdline', 'rb').read().replace(b'\0', b' ').decode(errors='replace')[:200]
         except OSError:
             continue
         if MINER.search(comm) or MINER.search(os.path.basename(exe)) or exe.startswith(('/dev/shm/', '/run/shm/')):  # nosec B108
             q = os.path.join(qdir, f'{pid}-{os.path.basename(exe).replace(" (deleted)", "")}')
             try:
-                shutil.copy(f'/proc/{pid}/exe', q)
+                shutil.copy(f'{PROC}/{pid}/exe', q)
                 os.chmod(q, 0)
             except OSError:
                 pass                                          # gone already; killed below anyway
@@ -651,10 +772,8 @@ def watch():
                           f'from {keyfile} now):\n' + '\n'.join(added))
     s['keys'] = keys
     rc, journal = sh("journalctl -u ssh -u sshd --since -6min -o cat 2>/dev/null | grep 'Accepted .* for root from'")
-    for line in journal.splitlines():
-        ip = line.split(' from ')[1].split()[0] if ' from ' in line else '?'
-        if not re.match(r'^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|::1)', ip):
-            critical.append(f'Root logged in over SSH from the internet: {ip}')
+    for ip in root_logins_from_internet(journal):
+        critical.append(f'Root logged in over SSH from the internet: {ip}')
     snap = snapshot()
     if 'files' in s:
         changed = [f for f in snap if s['files'].get(f) != snap[f]] + [f for f in s['files'] if f not in snap]
@@ -669,10 +788,11 @@ def watch():
     save(s)
     if critical:
         action = lockdown('; '.join(c.splitlines()[0] for c in critical))
-        mail('Intrusion signs on the server', '\n\n'.join(critical + alerts) + '\n\n' + action, level='critical')
+        mail('Intrusion signs on the server', '\n\n'.join(critical + alerts) + '\n\n' + action, level='critical',
+             category='Intrusion')
     elif alerts:
         key = 'host-' + hashlib.sha1(''.join(alerts).encode(), usedforsecurity=False).hexdigest()[:10]
-        mail('Host security alert', '\n\n'.join(alerts), key=key, level='alert')
+        mail(watch_subject(alerts), '\n\n'.join(alerts), key=key, level='alert', category='Host change')
     print(f'watch: {len(critical)} critical, {len(alerts)} alert(s)')
 
 
@@ -779,12 +899,14 @@ def feeds():
     s['feed_items'] = hist[-200:]
     save(s)
     if first:
-        mail('Early warning switched on', f'Baseline recorded: {len(seen)} known advisories. From now on only new '
+        mail(category='Advisory', subject='Early warning switched on',
+             body=f'Baseline recorded: {len(seen)} known advisories. From now on only new '
              'ones that touch this server are mailed.\n\n' + '\n\n'.join(news[:30]))
     elif urgent:
-        mail(f'{len(urgent)} security warning(s) for this server', '\n\n'.join(urgent + news), level='critical')
+        mail(f'{len(urgent)} security warning(s) for this server', '\n\n'.join(urgent + news), level='critical',
+             category='Advisory')
     elif [n for n in news if not n.startswith('(')]:
-        mail(f'{len(news)} new security notice(s)', '\n\n'.join(news))
+        mail(f'{len(news)} new security notice(s)', '\n\n'.join(news), category='Advisory')
     down = [n for n in news if n.startswith('(')]
     print(f'feeds: {len(urgent)} urgent, {len(news) - len(down)} notices, {len(seen)} known'
           + (f'; {len(down)} source(s) not reachable: ' + ' '.join(down) if down else ''))
@@ -821,7 +943,7 @@ def scan():
     s['scan'] = {'at': now(), 'lines': report, 'fixable_critical': worst, 'lynis': score}
     save(s)
     low = score is not None and score < int(C['LYNIS_MIN'])
-    mail('Weekly security scan' + (' (action needed)' if worst or low else ''),
+    mail(category='Scan', subject='Weekly security scan' + (' (action needed)' if worst or low else ''), body=
          '\n'.join(report) + ('\n\nCritical with a fix available:\n' + '\n'.join(worst) if worst else '') +
          (f'\n\nLynis below {C["LYNIS_MIN"]}: see {path("lynis-report.dat")}' if low else ''),
          level='alert' if worst or low else 'info')
@@ -873,11 +995,72 @@ def s3(method, key, body=b'', extra=None):
     headers['Authorization'] = f'AWS4-HMAC-SHA256 Credential={access}/{scope}, SignedHeaders={signed}, Signature={sig}'
     req = urllib.request.Request(endpoint + uri + ('?' + query if query else ''), data=body if method in ('PUT', 'POST') else None,
                                  method=method, headers={k2: v for k2, v in headers.items() if k2 != 'host'})
+    ctx = ssl.create_default_context(cafile=C['S3_CA_BUNDLE']) if C['S3_CA_BUNDLE'] else None
     try:
-        with urllib.request.urlopen(req, timeout=300) as r:  # nosec B310
+        with urllib.request.urlopen(req, timeout=300, context=ctx) as r:  # nosec B310
             return r.status, dict(r.headers), r.read()
     except urllib.error.HTTPError as e:
         return e.code, dict(e.headers), e.read()
+    except (urllib.error.URLError, OSError) as e:          # unreachable, TLS refused: a failure, not a crash
+        return 0, {}, str(e).encode()
+
+
+REMOTES = ('s3', 'azure', 'oci-par')
+
+
+def remote_kind():
+    """Where the off-site copy goes: s3, azure, oci-par, or '' (none)."""
+    kind = (C['BACKUP_REMOTE'] or ('s3' if C['S3_BUCKET'] else '')).lower()
+    if kind and kind not in REMOTES:
+        raise RuntimeError(f'BACKUP_REMOTE={kind} is not one of: {", ".join(REMOTES)}')
+    return kind
+
+
+def remote(method, name, body=b'', digest=''):
+    """One request for the off-site copy NAME: PUT, GET or HEAD. Returns (status, headers, body).
+    s3 signs with SigV4; azure (SAS) and oci-par (pre-authenticated request) carry their
+    permission in the URL, so the URL is a secret."""
+    kind, key = remote_kind(), C['S3_PREFIX'] + name
+    if kind == 's3':
+        extra = {'x-amz-checksum-sha256': base64.b64encode(bytes.fromhex(digest)).decode(),
+                 'x-amz-server-side-encryption': 'AES256', 'content-type': 'application/octet-stream'} if digest else None
+        return s3(method, key, body, extra)
+    url = C['BACKUP_REMOTE_URL']
+    if not url:
+        return 0, {}, f'BACKUP_REMOTE={kind} needs BACKUP_REMOTE_URL in {C["ENV_FILE"]}'.encode()
+    base, _, query = url.partition('?')
+    target = base.rstrip('/') + '/' + urllib.parse.quote(key) + ('?' + query if query else '')
+    if urllib.parse.urlparse(target).scheme not in ('https', 'http'):
+        return 0, {}, b'BACKUP_REMOTE_URL is not an http(s) URL'
+    headers = {'Content-Type': 'application/octet-stream'} if method == 'PUT' else {}
+    if kind == 'azure' and method == 'PUT':
+        headers.update({'x-ms-blob-type': 'BlockBlob', 'x-ms-version': '2021-08-06'})
+    req = urllib.request.Request(target, data=body if method == 'PUT' else None, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=300) as r:  # nosec B310 (http or https only, checked above)
+            return r.status, dict(r.headers), r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read()
+    except (urllib.error.URLError, OSError) as e:
+        return 0, {}, str(e).encode()
+
+
+def remote_confirms(headers, data):
+    """Does a HEAD answer prove the store holds exactly data? Every size and MD5 the store
+    reports must match, and at least one must be there (stores report different ones:
+    Content-Length, x-goog-stored-content-length, Content-MD5, x-goog-hash md5=...)."""
+    h = {k.lower(): v for k, v in headers.items()}
+    md5 = base64.b64encode(hashlib.md5(data, usedforsecurity=False).digest()).decode()
+    seen = []
+    for k in ('content-length', 'x-goog-stored-content-length'):
+        if h.get(k, '').isdigit():
+            seen.append(int(h[k]) == len(data))
+    if h.get('content-md5'):
+        seen.append(h['content-md5'] == md5)
+    for part in h.get('x-goog-hash', '').split(','):
+        if part.strip().startswith('md5='):
+            seen.append(part.strip()[4:] == md5)
+    return bool(seen) and all(seen)
 
 
 # ---------------------------------------------------------------- backup (nightly) and restore test (weekly)
@@ -938,28 +1121,29 @@ def backup():
         raise SystemExit(1)
     os.chmod(target, 0o600)
     digest = hashlib.sha256(open(target, 'rb').read()).hexdigest()
-    uploaded = None
-    if C['S3_BUCKET']:
+    uploaded, kind = None, remote_kind()
+    if kind:
         data = open(target, 'rb').read()
-        st, hdr, body = s3('PUT', C['S3_PREFIX'] + name, data,
-                           {'x-amz-checksum-sha256': base64.b64encode(bytes.fromhex(digest)).decode(),
-                            'x-amz-server-side-encryption': 'AES256', 'content-type': 'application/octet-stream'})
-        if st != 200:
-            mail('Backup upload FAILED', f'S3 answered {st}: {body[:400]!r}', key='backup-upload', level='alert')
+        st, hdr, body = remote('PUT', name, data, digest)
+        if st not in (200, 201):
+            mail('Backup upload FAILED', f'The off-site store ({kind}) answered {st}: {body[:400]!r}',
+                 key='backup-upload', level='alert')
             raise SystemExit(1)
-        st2, hdr2, _ = s3('HEAD', C['S3_PREFIX'] + name)
-        uploaded = st2 == 200 and int(hdr2.get('Content-Length', hdr2.get('content-length', -1))) == len(data)
+        st2, hdr2, _ = remote('HEAD', name)
+        uploaded = st2 == 200 and remote_confirms(hdr2, data)
         if not uploaded:
-            mail('Backup upload not confirmed', f'HEAD answered {st2}', key='backup-upload', level='alert')
+            mail('Backup upload not confirmed', f'The off-site store ({kind}) answered {st2} to HEAD',
+                 key='backup-upload', level='alert')
             raise SystemExit(1)
         resolved('backup-upload', 'Backup uploads working again')
     for old in sorted(glob.glob(os.path.join(C['BACKUP_DIR'], f'{C["BACKUP_PREFIX"]}-*.gpg')))[:-int(C['BACKUP_KEEP'])]:
         os.remove(old)
     s = load()
-    s['backup'] = {'at': now(), 'name': name, 'bytes': os.path.getsize(target), 'sha256': digest, 's3': uploaded}
+    s['backup'] = {'at': now(), 'name': name, 'bytes': os.path.getsize(target), 'sha256': digest, 's3': uploaded,
+                   'remote': kind if uploaded else ''}
     save(s)
     resolved('backup-failed', 'Backups working again')
-    print(f'backup: {name}, {os.path.getsize(target)} bytes, s3={uploaded}')
+    print(f'backup: {name}, {os.path.getsize(target)} bytes, off-site={kind if uploaded else "no"}')
 
 
 def restore_test():
@@ -974,10 +1158,12 @@ def restore_test():
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work, mode=0o700)
     enc = os.path.join(work, name)
-    if C['S3_BUCKET']:
-        st, hdr, body = s3('GET', C['S3_PREFIX'] + name)
+    if remote_kind():
+        st, hdr, body = remote('GET', name)
         if st != 200:
-            mail('Restore test FAILED', f'Could not download {name}: S3 {st}', level='alert')
+            mail(category='Backup', subject='Restore test FAILED',
+                 body=f'Could not download {name} from the off-site store ({remote_kind()}): {st}',
+                 level='alert')
             raise SystemExit(1)
         open(enc, 'wb').write(body)
     else:
@@ -1033,7 +1219,7 @@ def restore_test():
     s = load()
     s['restore_test'] = {'at': now(), 'ok': good, 'backup': name, 'tables': lines[:12]}
     save(s)
-    mail('Restore test ' + ('passed' if good else 'FAILED'),
+    mail(category='Backup', subject='Restore test ' + ('passed' if good else 'FAILED'), body=
          f'Backup {name}: checksum {"matches" if ok_sum else "DOES NOT MATCH"}, restored '
          f'{how if good else "with errors: " + text[-400:]}.\n\nWhat it holds:\n' +
          '\n'.join(lines), level='info' if good else 'alert')
@@ -1049,7 +1235,8 @@ def patch_window():
         return
     ok, detail = replication()
     if ok is False:
-        mail('Reboot postponed', 'Security updates need a reboot, but data lake replication is not healthy '
+        mail(category='Updates', subject='Reboot postponed',
+             body='Security updates need a reboot, but data lake replication is not healthy '
              f'({detail}). It is tried again in the next window.', key='reboot-postponed', level='alert')
         return
     backup()
@@ -1057,7 +1244,8 @@ def patch_window():
     s = load()
     s['planned_reboot'] = {'at': now(), 'packages': pkgs}
     save(s)
-    mail('Rebooting for security updates', 'Packages: ' + ' '.join(pkgs[:30]) + '\nA fresh backup was taken first. '
+    mail(category='Updates', subject='Rebooting for security updates',
+         body='Packages: ' + ' '.join(pkgs[:30]) + '\nA fresh backup was taken first. '
          'You get a mail when the server is back, with its health.')
     sh('systemctl reboot', 30)
 
@@ -1068,7 +1256,8 @@ def boot():
     planned = s.pop('planned_reboot', None)
     save(s)
     problems = [f'{subj}' for key, bad, subj, _ in checks() if bad and key != 'reboot']
-    mail('Server started' + (' after the planned patch reboot' if planned else ' (not planned by host-guard)'),
+    mail(category='Updates' if planned else 'Health',
+         subject='Server started' + (' after the planned patch reboot' if planned else ' (not planned by host-guard)'), body=
          out('uptime') + '\n\nHealth: ' + ('all good' if not problems else '\n  ' + '\n  '.join(problems)),
          level='info' if planned and not problems else 'alert')
 
@@ -1150,6 +1339,109 @@ def imds(path_):
             timeout=2).read().decode().strip()
     except Exception:
         return None
+
+
+MD = 'http://169.254.169.254'
+CLOUD_NAMES = {'aws': 'AWS', 'gcp': 'Google Cloud', 'azure': 'Azure', 'oci': 'Oracle Cloud',
+               'other': 'not a known cloud (a VPS or bare metal)'}
+_CLOUD = {}
+
+
+def _md(url, headers, timeout=1.0):
+    r = urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout)  # nosec B310 (fixed URLs)
+    return r.read().decode().strip(), r.headers
+
+
+def cloud_info():
+    """The cloud this server runs on and its machine type and region, from the cloud's own
+    metadata service (each answers only with its own header, so a wrong guess fails fast).
+    CLOUD=aws|gcp|azure|oci|other skips the guessing. Asked once per run."""
+    if _CLOUD:
+        return _CLOUD
+
+    def aws():
+        t = imds('instance-type')
+        return {'type': t, 'region': imds('placement/region') or ''} if t else None
+
+    def gcp():
+        h = {'Metadata-Flavor': 'Google'}
+        text, hdr = _md(MD + '/computeMetadata/v1/instance/machine-type', h)
+        if hdr.get('Metadata-Flavor') != 'Google':
+            return None
+        return {'type': text.rsplit('/', 1)[-1],
+                'region': _md(MD + '/computeMetadata/v1/instance/zone', h)[0].rsplit('/', 1)[-1]}
+
+    def azure():
+        d = json.loads(_md(MD + '/metadata/instance/compute?api-version=2021-02-01', {'Metadata': 'true'})[0])
+        return {'type': d['vmSize'], 'region': d['location']}
+
+    def oci():
+        d = json.loads(_md(MD + '/opc/v2/instance/', {'Authorization': 'Bearer Oracle'})[0])
+        return {'type': d['shape'], 'region': d.get('canonicalRegionName') or d.get('region', '')}
+
+    probes = {'aws': aws, 'gcp': gcp, 'azure': azure, 'oci': oci}
+    want = C['CLOUD'].lower()
+    _CLOUD.update({'cloud': want if want else 'other', 'type': '', 'region': ''})
+    for name in ([want] if want in probes else [] if want else list(probes)):
+        try:
+            got = probes[name]()
+        except Exception:
+            got = None
+        if got:
+            _CLOUD.update(cloud=name, **got)
+            break
+    return _CLOUD
+
+
+def machine_kind():
+    """bare metal, a virtual machine (kvm, xen, microsoft, ...), or a container."""
+    rc, text = sh('systemd-detect-virt 2>/dev/null', 10)
+    v = text.strip().splitlines()[0] if text.strip() else ''
+    if v == 'none':
+        return 'bare metal'
+    return f'virtual machine ({v})' if v else 'not known (no systemd-detect-virt)'
+
+
+ADVICE = {
+    'aws': ['Off-site copies: an S3 bucket (--s3-bucket NAME --region REGION); give the instance a role that may '
+            'write to it, and no keys are needed.',
+            'Running cost: estimated from AWS\'s published prices.'],
+    'gcp': ['Off-site copies: a Cloud Storage bucket through its S3 interoperability: S3_BUCKET, '
+            'S3_ENDPOINT=https://storage.googleapis.com, AWS_REGION=auto, and an HMAC key (a service account\'s) '
+            'as AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in .env.',
+            'SSH: with OS Login, --login-user is your OS Login name (for example you_example_com).',
+            'Running cost: set PRICE_HOUR (and the other PRICE_ values) to Google\'s prices.'],
+    'azure': ['Off-site copies: BACKUP_REMOTE=azure in guard.conf and a container SAS URL (read, create, write) '
+              'as BACKUP_REMOTE_URL in .env.',
+              'SSH: the image\'s admin user is usually azureuser.',
+              'Running cost: set PRICE_HOUR (and the other PRICE_ values) to Azure\'s prices.'],
+    'oci': ['Off-site copies: BACKUP_REMOTE=oci-par in guard.conf and a bucket pre-authenticated request URL '
+            '(objects read and write) as BACKUP_REMOTE_URL in .env; or the S3 compatibility API with a customer '
+            'secret key (S3_ENDPOINT=https://NAMESPACE.compat.objectstorage.REGION.oraclecloud.com).',
+            'Firewall: Oracle\'s Ubuntu images keep their own rules in /etc/iptables/rules.v4; host-guard adds to them.',
+            'Running cost: set PRICE_HOUR (and the other PRICE_ values) to Oracle\'s prices.'],
+    'other': ['Off-site copies: any S3-compatible store (Cloudflare R2, Backblaze B2, Wasabi, MinIO, Hetzner) '
+              'with S3_BUCKET, S3_ENDPOINT and its keys in .env; Azure Blob or an OCI pre-authenticated URL work too.',
+              'Running cost: set PRICE_HOUR (and the other PRICE_ values) to your provider\'s prices, or leave it.'],
+}
+
+
+def whereami():
+    """Where host-guard runs and what fits there. --short prints only the cloud name."""
+    c = cloud_info()
+    if '--short' in sys.argv:
+        print(c['cloud'])
+        return
+    print(f'Cloud: {cloud_text()}')
+    print(f'Machine: {machine_kind()}')
+    for line in ADVICE.get(c['cloud'], ADVICE['other']):
+        print(f'  - {line}')
+
+
+def cloud_text():
+    c = cloud_info()
+    where = ', '.join(x for x in (c['type'], c['region']) if x)
+    return CLOUD_NAMES.get(c['cloud'], c['cloud']) + (f' ({where})' if where else '')
 
 
 def price_files(region):
@@ -1235,9 +1527,10 @@ def ebs_gb():
 
 def cost_estimate():
     """What the server costs, from the published prices and the measured usage."""
-    itype = C['INSTANCE_TYPE'] or imds('instance-type') or ''
+    on_aws = cloud_info()['cloud'] == 'aws' or bool(C['INSTANCE_TYPE'])
+    itype = C['INSTANCE_TYPE'] or (imds('instance-type') if on_aws else '') or ''
     region = C['AWS_REGION'] or 'ap-south-1'
-    pf = price_files(region)
+    pf = price_files(region) if on_aws else {}
     spec = pf.get('ec2', {}).get(itype, {})
     hour = float(C['PRICE_HOUR']) if C['PRICE_HOUR'] else spec.get('price')
     live = bool(spec) and not C['PRICE_HOUR']
@@ -1245,11 +1538,11 @@ def cost_estimate():
     egress_p = rate(pf.get('transfer'), 'DataTransfer External Outbound Next 10 TB', default=float(C['PRICE_EGRESS_GB']))
     ipv4_p = rate(pf.get('vpc'), 'In use Public IPv4', default=float(C['PRICE_IPV4_HOUR']))
     s3_p = rate(pf.get('s3'), 'Standard Storage First 50 TB', default=float(C['PRICE_S3_GB_MONTH']))
-    public = C['PUBLIC_IPV4'] == 'yes' or (C['PUBLIC_IPV4'] == 'auto' and bool(imds('public-ipv4')))
+    public = C['PUBLIC_IPV4'] == 'yes' or (C['PUBLIC_IPV4'] == 'auto' and on_aws and bool(imds('public-ipv4')))
     use = usage_stats() or {}
     disk = ebs_gb()
     b = load().get('backup', {})
-    s3_gb = (b.get('bytes', 0) / 1e9) * int(C['S3_RETENTION_DAYS']) if C['S3_BUCKET'] else 0.0
+    s3_gb = (b.get('bytes', 0) / 1e9) * int(C['S3_RETENTION_DAYS']) if remote_kind() == 's3' else 0.0
     month_h = 730.0
     lines = {
         'instance': (hour or 0) * month_h,
@@ -1291,6 +1584,7 @@ def cost_estimate():
     ideas.append('Savings Plans or reserved instances lower the instance price for a 1 or 3 year commitment '
                  '(AWS Pricing Calculator)')
     return {'instance_type': itype or 'unknown', 'region': region, 'spec': spec, 'live_prices': live,
+            'priced': on_aws or bool(C['PRICE_HOUR']),
             'published': pf.get('published'), 'month': round(month, 2), 'day': round(month / 30.4, 2),
             'lines': {k: round(v, 2) for k, v in lines.items()}, 'per_service': per_service, 'use': use,
             'disk_gb': disk, 'public_ipv4': public, 'ideas': ideas,
@@ -1306,6 +1600,11 @@ def money(usd):
 def cost_text(nodes=None):
     e = cost_estimate()
     u = e['use']
+    if not e['priced']:
+        return ('== Running cost\n'
+                f'This server runs on {cloud_text()}. The estimate is built from AWS\'s published prices, so it is '
+                'not made here: set PRICE_HOUR (and PRICE_EBS_GB_MONTH, PRICE_EGRESS_GB, PRICE_IPV4_HOUR) in '
+                'guard.conf to your provider\'s prices for one.'), e
     src = (f'AWS list prices published {e["published"][:10]}' if e['published'] else 'configured prices (AWS price files not reachable)')
     spec = e['spec']
     parts = [f'== Running cost (estimate, {src}, {e["region"]})',
@@ -1370,7 +1669,7 @@ def report_text():
         glance.append((area, 'OK' if ok else 'ATTENTION', detail))
 
     up, load_ = _uptime()
-    head = [f'Server: {C["SITE"]}', f'Report time: {stamp()}']
+    head = [f'Server: {C["SITE"]}', f'Runs on: {cloud_text()}', f'Report time: {stamp()}']
     head += [f'Up for: {up}', f'Load (1/5/15 min): {load_}'] if up else []
 
     parts = ['== Memory and disk']
@@ -1425,7 +1724,7 @@ def report_text():
     b, rt = s.get('backup', {}), s.get('restore_test', {})
     fresh = bool(b.get('at')) and now() - b['at'] < float(C['BACKUP_MAX_AGE_H']) * 3600
     parts += ['', '== Backups', f'Last backup: {b.get("name", "none")} ({ago(b.get("at"))}, '
-              f'{b.get("bytes", 0) // 1024} KB, S3: {"yes" if b.get("s3") else "no"})',
+              f'{b.get("bytes", 0) // 1024} KB, off-site copy: {b.get("remote") or ("s3" if b.get("s3") else "no")})',
               f'Restore test: {"PASSED" if rt.get("ok") else "not passed yet"} ({ago(rt.get("at"))})']
     mark('Backups', (fresh and rt.get('ok', True)) if backup_configured() else False, f'last {ago(b.get("at"))}, restore test '
          + ('passed' if rt.get('ok') else 'not run yet' if not rt else 'FAILED'))
@@ -1472,6 +1771,13 @@ def report_text():
         parts += ['', f'== Running cost: not available ({str(ex)[:120]})']
     sent = [m for m in load('mail-log.json').get('sent', []) if m['at'] > day]
     parts += ['', f'== Mails in 24 h: {len(sent)}'] + [f'  {stamp(m["at"])[11:16]}  {m["subject"]}' for m in sent[-15:]]
+    held = [h for h in load('mail-log.json').get('held_log', []) if h['at'] > day]
+    if held:
+        by_cat = {}
+        for h in held:
+            by_cat[h['category']] = by_cat.get(h['category'], 0) + 1
+        parts += [f'Held back by flood protection: {len(held)} ('
+                  + ', '.join(f'{c} {n}' for c, n in sorted(by_cat.items())) + ')']
 
     problems = [v.get('subject', k) for k, v in sorted(load('alerts.json').items())]
     top = head + ['', '== At a glance'] + [f'  {a:<22}  {st_}  {d}' for a, st_, d in glance]
@@ -1483,7 +1789,8 @@ def report_text():
 def report():
     text = report_text()
     open_problems = len(load('alerts.json'))
-    mail('Daily report' + (f': {open_problems} open problem(s)' if open_problems else ': all good'), text)
+    mail('Daily report' + (f': {open_problems} open problem(s)' if open_problems else ': all good'), text,
+         level='daily', category='Daily report')
     print(text)
 
 
@@ -1537,17 +1844,17 @@ def export():
 
 
 def test_mail():
-    ok = mail('Test mail', 'If you can read this, host-guard can reach you.')
+    ok = mail('Test mail', 'If you can read this, host-guard can reach you.', category='Test')
     print('sent' if ok else 'NOT sent: check /etc/msmtprc and the MAIL_TO setting')
     sys.exit(0 if ok else 1)
 
 
 COMMANDS = {'health': health, 'cost': cost, 'watch': watch, 'feeds': feeds, 'scan': scan, 'backup': backup,
             'restore-test': restore_test, 'patch-window': patch_window, 'boot': boot, 'report': report,
-            'status': status, 'test-mail': test_mail, 'unlock': unlock, 'export': export}
+            'status': status, 'test-mail': test_mail, 'unlock': unlock, 'export': export, 'whereami': whereami}
 
 if __name__ == '__main__':
-    if len(sys.argv) == 2 and sys.argv[1] in COMMANDS:
+    if len(sys.argv) == 2 and sys.argv[1] in COMMANDS or sys.argv[1:] == ['whereami', '--short']:
         COMMANDS[sys.argv[1]]()
     else:
         print(__doc__)

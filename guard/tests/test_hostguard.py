@@ -28,6 +28,7 @@ def hg(tmp_path, monkeypatch, request):
                        f"open({str(sent)!r}, 'a', encoding='utf-8').write(sys.stdin.read())\n")
     monkeypatch.setenv('HG_NOTIFY_CMD', f'"{sys.executable}" "{catcher}"')
     monkeypatch.setenv('HG_SITE', 'test-host')
+    monkeypatch.setenv('HG_CLOUD', 'other')                # never ask a real metadata service
     # most tests run as the EdgeShell profile (examples/profiles/edgeshell.conf): a Compose app with
     # a MariaDB primary and replica; the test_a_plain_server_* tests run with nothing set
     if request.node.name.startswith('test_a_plain_server'):
@@ -58,7 +59,8 @@ def test_a_problem_mails_once_then_resolved(hg):
     hg.resolved('disk', 'Disk back under the limit')
     hg.resolved('disk', 'Disk back under the limit')                              # only once
     text = hg.SENT.read_text()
-    assert mails(hg) == 2 and '[ALERT] [test-host] Disk 91% full' in text and '[RESOLVED] [test-host] Disk back' in text
+    assert mails(hg) == 2 and '[P2 Attention] Health | test-host | Disk 91% full' in text
+    assert '[Resolved] Health | test-host | Disk back' in text
     log = json.load(open(os.path.join(hg.C['STATE_DIR'], 'mail-log.json')))
     assert [m['level'] for m in log['sent']] == ['alert', 'resolved']
 
@@ -109,7 +111,7 @@ def test_early_warning_baselines_then_mails_only_what_runs_here(hg, monkeypatch)
         'affected': [{'ranges': [{'events': [{'introduced': '0'}, {'fixed': '3.1.4'}]}]}]}})
     hg.feeds()
     text = hg.SENT.read_text().split('Subject: ')[-1]
-    assert text.startswith('[CRITICAL] [test-host] 2 security warning(s)')
+    assert text.startswith('[P1 Critical] Advisory | test-host | 2 security warning(s)')
     assert 'CVE-2026-1111' in text and 'CVE-2026-2222' not in text
     assert 'USN-7000-1' in text and 'USN-7001-1' not in text
     assert 'werkzeug 3.1.0 has GHSA-xxxx-yyyy-zzzz (CVE-2026-3333)' in text and 'fixed in: 3.1.4' in text
@@ -133,7 +135,7 @@ def test_the_daily_report_has_every_part(hg, monkeypatch):
     text = hg.report_text()
     for part in ('== Memory', '== Containers', 'edgeshell       Up 3 days (healthy)', 'Version 1.19.0, nodes online 5 of 6',
                  'Pi Nodes', 'Open alerts: 1 critical, 2 warning on 2 node(s)', '== Database replica', 'IO Yes',
-                 'edgeshell-db-x.sql.gz.gpg (30 min ago, 2000 KB, S3: yes)', 'Host watch: 1 finding(s)', 'eve',
+                 'edgeshell-db-x.sql.gz.gpg (30 min ago, 2000 KB, off-site copy: s3)', 'Host watch: 1 finding(s)', 'eve',
                  '== Early warning', '== Updates', '== Last weekly scan', '== At a glance'):
         assert part in text, part
     glance = text.split('== At a glance')[1].split('\n\n')[0]
@@ -157,7 +159,7 @@ def test_s3_requests_are_signed_like_aws(hg, monkeypatch):
 
         def __exit__(self, *a):
             return False
-    monkeypatch.setattr(hg.urllib.request, 'urlopen', lambda req, timeout=0: (seen.update(req=req), R())[1])
+    monkeypatch.setattr(hg.urllib.request, 'urlopen', lambda req, timeout=0, **kw: (seen.update(req=req), R())[1])
     hg.C.update(S3_BUCKET='backups', S3_ENDPOINT='http://127.0.0.1:4566', AWS_REGION='us-east-1',
                 AWS_ACCESS_KEY_ID='AKIDEXAMPLE', AWS_SECRET_ACCESS_KEY='wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY')
     st, _, _ = hg.s3('PUT', 'edgeshell-db/x.gpg', b'hello', {'x-amz-checksum-sha256': 'abc'})
@@ -401,3 +403,194 @@ def test_every_profile_uses_only_known_settings(hg):
     for p in profiles:
         for k in hg.read_kv(p):
             assert k in hg.DEFAULTS and k not in hg.SECRETS, f'{os.path.basename(p)}: {k}'
+
+
+def fake_proc(tmp_path, procs):
+    proc = tmp_path / 'proc'
+    for pid, cmdline in procs.items():
+        (proc / str(pid)).mkdir(parents=True)
+        (proc / str(pid) / 'cmdline').write_bytes(cmdline.replace(' ', '\0').encode() + b'\0')
+        (proc / str(pid) / 'comm').write_text(cmdline.split()[0].split('/')[-1][:15])
+    return proc
+
+
+def test_a_second_root_account_is_locked_without_killing_root_processes(hg, tmp_path, monkeypatch):
+    """Red-team HOST-1: pkill -u NAME on a UID 0 account kills every root process (sshd, Docker,
+    the web server, host-guard itself). Only that account's own SSH logins may end."""
+    passwd = tmp_path / 'passwd'
+    passwd.write_text('root:x:0:0:root:/root:/bin/bash\nops:x:1000:1000::/home/ops:/bin/bash\n'
+                      'sysbackup:x:0:0::/root:/bin/bash\n')
+    proc = fake_proc(tmp_path, {1: '/sbin/init', 101: '/usr/sbin/sshd -D', 102: 'sshd: ops@pts/0',
+                                103: 'sshd-session: sysbackup [priv]', 104: 'sshd: sysbackup@pts/1',
+                                105: '/usr/bin/dockerd -H fd://', 106: 'sshd: sysbackup2@pts/2'})
+    monkeypatch.setattr(hg, 'PASSWD', str(passwd))
+    monkeypatch.setattr(hg, 'PROC', str(proc))
+    real, cmds = hg.sh, []
+
+    def sh(cmd, timeout=120, input=None):
+        cmds.append(cmd)
+        return real(cmd, timeout, input) if 'catch.py' in cmd else (0, '')
+    monkeypatch.setattr(hg, 'sh', sh)
+    hg.watch()
+    assert 'usermod -L -e 1 sysbackup' in cmds
+    assert not any('pkill' in c for c in cmds)
+    assert sorted(c for c in cmds if c.startswith('kill')) == ['kill -9 103', 'kill -9 104']
+    text = hg.SENT.read_text()
+    assert '[P1 Critical] Intrusion | test-host |' in text
+    assert 'Extra root (UID 0) account "sysbackup": locked; 2 of its SSH login' in text
+
+
+def test_web_probe_filter_matches_after_fail2ban_cuts_the_date():
+    """Red-team WEB-1: fail2ban removes the time stamp before matching, leaving [] in the line."""
+    import re
+    text = open(os.path.join(HERE, 'conf', 'base-hardening.sh'), encoding='utf-8').read()
+    rx = re.search(r'^failregex = (.*)$', text, re.M).group(1).replace('<HOST>', r'(?P<host>\S+)')
+    cut = '172.18.0.5 - - [] "GET /.env HTTP/1.1" 404 162 "-" "curl/8.5.0"'
+    assert re.match(rx, cut).group('host') == '172.18.0.5'
+    assert not re.match(rx, '172.18.0.5 - - [] "GET /index.html HTTP/1.1" 200 162 "-" "curl/8.5.0"')
+
+
+def test_only_real_root_logins_count(hg):
+    """Red-team HOST-8: with /etc/ld.so.preload set, loader warnings mention "from
+    /etc/ld.so.preload"; that is not a login (it was mailed as one)."""
+    journal = ("ERROR: ld.so: object '/usr/lib/x.so' from /etc/ld.so.preload cannot be preloaded: ignored.\n"
+               'Accepted publickey for root from 8.8.4.4 port 50122 ssh2: ED25519 SHA256:abc\n'
+               'Accepted publickey for root from 10.0.0.5 port 50123 ssh2\n'
+               'Accepted publickey for root from 100.101.102.103 port 50124 ssh2\n'
+               'Accepted password for root from 2606:4700:4700::1111 port 50125 ssh2\n'
+               'Accepted publickey for ops from 198.51.100.7 port 50126 ssh2\n')
+    assert hg.root_logins_from_internet(journal) == ['8.8.4.4', '2606:4700:4700::1111']
+
+
+def test_an_upload_is_confirmed_by_every_size_and_checksum_the_store_reports(hg):
+    import base64
+    import hashlib
+    data = b'x' * 1000
+    md5 = base64.b64encode(hashlib.md5(data).digest()).decode()
+    assert hg.remote_confirms({'Content-Length': '1000'}, data)                         # S3, Azure
+    assert hg.remote_confirms({'x-goog-stored-content-length': '1000', 'x-goog-hash': f'crc32c=x,md5={md5}'}, data)
+    assert hg.remote_confirms({'content-md5': md5}, data)                               # OCI
+    assert not hg.remote_confirms({'Content-Length': '999'}, data)
+    assert not hg.remote_confirms({'Content-Length': '1000', 'content-md5': 'AAAA'}, data)   # one disagrees
+    assert not hg.remote_confirms({'Content-Type': 'application/octet-stream'}, data)        # nothing to check
+
+
+def test_remote_urls_carry_the_object_name_before_the_signature(hg, monkeypatch):
+    seen = []
+
+    class Resp:
+        status, headers = 201, {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b''
+
+    def fake(req, timeout=0):
+        seen.append((req.get_method(), req.full_url, dict(req.header_items())))
+        return Resp()
+    monkeypatch.setattr(hg.urllib.request, 'urlopen', fake)
+    hg.C.update({'BACKUP_REMOTE': 'azure', 'S3_PREFIX': 'host-guard/',
+                 'BACKUP_REMOTE_URL': 'https://acct.blob.core.windows.net/backups?sv=2021-08-06&sp=rcwl&sig=abc%3D'})
+    hg.remote('PUT', 'db-1.sql.gz.gpg', b'data')
+    method, url, headers = seen[-1]
+    assert url == 'https://acct.blob.core.windows.net/backups/host-guard/db-1.sql.gz.gpg?sv=2021-08-06&sp=rcwl&sig=abc%3D'
+    assert headers.get('X-ms-blob-type') == 'BlockBlob'
+    hg.C.update({'BACKUP_REMOTE': 'oci-par',
+                 'BACKUP_REMOTE_URL': 'https://objectstorage.ap-mumbai-1.oraclecloud.com/p/TOKEN/n/ns/b/backups/o/'})
+    hg.remote('GET', 'db-1.sql.gz.gpg')
+    assert seen[-1][1] == 'https://objectstorage.ap-mumbai-1.oraclecloud.com/p/TOKEN/n/ns/b/backups/o/host-guard/db-1.sql.gz.gpg'
+    hg.C.update({'BACKUP_REMOTE_URL': 'file:///etc/shadow'})
+    assert hg.remote('GET', 'x')[0] == 0                      # only http(s)
+
+
+def test_the_cloud_is_read_from_its_own_metadata_service(hg, monkeypatch):
+
+    answers = {
+        'gcp': {'/computeMetadata/v1/instance/machine-type': ('projects/1/machineTypes/e2-medium', {'Metadata-Flavor': 'Google'}),
+                '/computeMetadata/v1/instance/zone': ('projects/1/zones/asia-south1-a', {'Metadata-Flavor': 'Google'})},
+        'azure': {'/metadata/instance/compute': ('{"vmSize": "Standard_B2s", "location": "centralindia"}', {})},
+        'oci': {'/opc/v2/instance/': ('{"shape": "VM.Standard.E4.Flex", "canonicalRegionName": "ap-mumbai-1"}', {})},
+    }
+    for cloud, table in answers.items():
+        def md(url, headers, timeout=1.0, table=table):
+            path_ = url.split('169.254.169.254', 1)[1].split('?')[0]
+            if path_ not in table:
+                raise OSError('no route')
+            return table[path_]
+        monkeypatch.setattr(hg, '_md', md)
+        monkeypatch.setattr(hg, 'imds', lambda p: None)
+        hg._CLOUD.clear()
+        hg.C['CLOUD'] = ''
+        info = hg.cloud_info()
+        assert info['cloud'] == cloud, info
+    assert hg.cloud_info()['type'] == 'VM.Standard.E4.Flex' and 'Oracle Cloud' in hg.cloud_text()
+    hg._CLOUD.clear()
+    monkeypatch.setattr(hg, '_md', lambda *a, **k: (_ for _ in ()).throw(OSError('no metadata service')))
+    assert hg.cloud_info()['cloud'] == 'other'                # bare metal or a plain VPS
+    hg._CLOUD.clear()
+    hg.C['CLOUD'] = 'gcp'
+    assert hg.cloud_info()['cloud'] == 'gcp'                  # set by hand: no guessing, never fails
+
+
+def test_off_aws_the_cost_section_says_why_instead_of_guessing(hg, monkeypatch):
+    hg._CLOUD.clear()
+    hg._CLOUD.update({'cloud': 'azure', 'type': 'Standard_B2s', 'region': 'centralindia'})
+    monkeypatch.setattr(hg, 'price_files', lambda region: (_ for _ in ()).throw(AssertionError('AWS prices fetched')))
+    text, e = hg.cost_text()
+    assert 'Azure (Standard_B2s, centralindia)' in text and 'PRICE_HOUR' in text and not e['priced']
+
+
+def test_every_mail_says_severity_category_and_server_and_carries_filter_headers(hg):
+    hg.mail('Intrusion signs on the server', 'x', level='critical', category='Intrusion')
+    hg.mail('Blocked 3 address(es)', 'x', key='ban-1', level='alert', category='Attack')
+    hg.mail('Daily report: all good', 'x', level='daily', category='Daily report')
+    raw = hg.SENT.read_text()
+    assert 'Subject: [P1 Critical] Intrusion | test-host | Intrusion signs on the server' in raw
+    assert 'Subject: [P2 Attention] Attack | test-host | Blocked 3 address(es)' in raw
+    assert 'Subject: [Daily] Daily report | test-host | Daily report: all good' in raw
+    assert 'List-Id: host-guard Intrusion <intrusion.test-host.host-guard>' in raw
+    assert 'X-Host-Guard-Severity: P1' in raw and 'X-Host-Guard-Category: Attack' in raw
+    first = raw.split('Subject: ')[1]
+    assert 'X-Priority: 1' in first and 'Importance: high' in first          # only the critical one
+    assert raw.count('X-Priority: 1') == 1
+
+
+def test_a_flood_of_similar_mails_is_held_and_named_in_the_next_one(hg, monkeypatch):
+    """An attack that trips a ban every few minutes must not bury the inbox: P2 mails of one
+    category are capped an hour; a P1 mail always goes out."""
+    hg.C['MAIL_MAX_PER_HOUR'] = '2'
+    for i in range(5):
+        hg.mail(f'Blocked address 198.51.100.{i}', 'x', key=f'ban-{i}', level='alert', category='Attack')
+    assert mails(hg) == 2
+    log = hg.load('mail-log.json')
+    assert [h['subject'] for h in log['held']] == [f'Blocked address 198.51.100.{i}' for i in (2, 3, 4)]
+    assert hg.mail('Intrusion signs on the server', 'x', level='critical', category='Attack')   # never held
+    assert mails(hg) == 3
+    text = hg.SENT.read_text().split('Subject: ')[-1]
+    assert 'Held back in the last hour (3 similar mail(s), flood protection)' in text
+    assert 'Blocked address 198.51.100.4' in text
+    assert hg.load('mail-log.json')['held'] == []                         # named once, then cleared
+    hg.mail('Disk 91% full', 'x', key='disk', level='alert', category='Health')
+    assert mails(hg) == 4                                                 # another category: its own budget
+    assert len(hg.load('mail-log.json')['held_log']) == 3                # still counted for the daily report
+
+
+def test_signs_of_someone_on_the_server_are_never_held(hg):
+    """Red-team HOST-9: four noisy changes must not hide the fifth (a new login account)."""
+    hg.C['MAIL_MAX_PER_HOUR'] = '2'
+    for i in range(4):
+        assert hg.mail(f'Security files changed {i}', 'x', key=f'host-{i}', level='alert', category='Host change')
+    assert hg.mail('New login account: support', 'x', key='host-9', level='alert', category='Host change')
+    assert mails(hg) == 5 and not hg.load('mail-log.json').get('held')
+
+
+def test_the_watch_subject_says_what_was_found(hg):
+    assert hg.watch_subject(['New account that can log in: "support". If it is not yours: sudo usermod -L support',
+                             'SSH key(s) added for ops (not removed: ...)\nssh-ed25519 AAAA',
+                             'Security-relevant files changed (normal after updates ...):\n  /etc/crontab']) == \
+        'New login account: support; SSH key added; Security files changed'

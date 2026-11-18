@@ -98,7 +98,8 @@ def unR(p):
 def run(cmd, **kw):
     """Run a command; returns the exit code. Replaced in the tests."""
     try:
-        return subprocess.run(cmd, check=False, **kw).returncode  # nosec B603: fixed argument lists
+        # argument lists only, never a shell
+        return subprocess.run(cmd, check=False, **kw).returncode  # nosec B603
     except FileNotFoundError:
         return 127
 
@@ -339,16 +340,21 @@ def put(p, meta, src):
 
 
 def checks(paths):
-    """sshd and fail2ban must accept their settings. Returns a list of problems."""
-    bad = []
+    """Settings checked before they apply. Returns (stop, warn): SSH settings sshd rejects
+    stop everything (a lockout); fail2ban settings it rejects only warn, since fail2ban then
+    stops protecting but nobody is locked out (stock fail2ban on Debian 12 is such a case:
+    its sshd jail wants /var/log/auth.log, which a journald-only system does not have)."""
+    stop, warn = [], []
     if any(p.startswith('/etc/ssh/') for p in paths) and have('sshd'):
         os.makedirs('/run/sshd', exist_ok=True)
         if run(['sshd', '-t']) != 0:
-            bad.append('sshd -t rejected the SSH settings')
+            stop.append('sshd -t rejected the SSH settings')
     if any(p.startswith('/etc/fail2ban/') for p in paths) and have('fail2ban-client'):
-        if run(['fail2ban-client', '-t'], stdout=subprocess.DEVNULL) != 0:
-            bad.append('fail2ban-client -t rejected the fail2ban settings')
-    return bad
+        if run(['fail2ban-client', '-t'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
+            warn.append('fail2ban will not start with these settings (fail2ban-client -t), so it is not protecting '
+                        'this server. As it was before host-guard: fix /etc/fail2ban/jail.d, or remove fail2ban '
+                        '(uninstall --purge does when host-guard installed it)')
+    return stop, warn
 
 
 def unit_of(p):
@@ -407,9 +413,11 @@ def undo(folder, manifest, force=False):
         for ch, cur in plan:
             put(ch['path'], ch['before'], os.path.join(files, ch['path'].lstrip('/')))
             done.append((ch, cur))
-        bad = checks([ch['path'] for ch, _ in plan])
+        bad, warn = checks([ch['path'] for ch, _ in plan])
         if bad:
             raise Fail('; '.join(bad))
+        for w in warn:
+            print(f'  WARNING: {w}')
     except Exception as e:
         for ch, cur in reversed(done):
             put(ch['path'], cur, os.path.join(saved, ch['path'].lstrip('/')))
@@ -632,7 +640,8 @@ def install_manager_copy(version):
     os.makedirs(os.path.dirname(R(WRAPPER)), exist_ok=True)
     with open(R(WRAPPER) + '.new', 'w', encoding='utf-8') as f:
         f.write(wrapper)
-    os.chmod(R(WRAPPER) + '.new', 0o755)
+    # a root-owned command must be executable by root
+    os.chmod(R(WRAPPER) + '.new', 0o755)  # nosec B103
     os.replace(R(WRAPPER) + '.new', R(WRAPPER))
 
 
