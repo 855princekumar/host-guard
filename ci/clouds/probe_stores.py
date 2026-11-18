@@ -6,6 +6,7 @@ import datetime as dt
 import hashlib
 import hmac
 import json
+import os
 import sys
 import urllib.error
 import urllib.parse
@@ -30,8 +31,10 @@ def gcp():
     return {'store': 'gcs', 'create_bucket': st, 'detail': text[:200]}
 
 
-AZ_ACCOUNT = 'devstoreaccount1'
-AZ_KEY = 'Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=='   # the public dev key
+# A random account and key made by ci/clouds/run.sh for each run (Azurite takes it through
+# AZURITE_ACCOUNTS); no key is written in the repository.
+AZ_ACCOUNT = os.environ.get('AZ_ACCOUNT', 'hgtest')
+AZ_KEY = os.environ.get('AZ_KEY', '')
 
 
 def az_sas(container, account=AZ_ACCOUNT, key=AZ_KEY):
@@ -53,12 +56,13 @@ def account_sas(account=AZ_ACCOUNT, key=AZ_KEY):
 
 
 def azure(host):
-    base = f'http://{host}/{AZ_ACCOUNT}/hg-backups'
+    account = AZ_ACCOUNT
+    base = f'http://{host}/{account}/hg-backups'
     st, text = call('PUT', base + '?restype=container', b'', {'x-ms-version': '2021-08-06', 'x-ms-date':
                     dt.datetime.now(dt.timezone.utc).strftime('%a, %d %b %Y %H:%M:%S GMT')})
     if st == 403:   # Azurite checks signatures: create the container with an account SAS
-        st, text = call('PUT', base + '?restype=container&' + account_sas(), b'', {'x-ms-version': '2021-08-06'})
-    return {'store': 'azure', 'host': host, 'create_container': st, 'url': base + '?' + az_sas('hg-backups'),
+        st, text = call('PUT', base + '?restype=container&' + account_sas(account), b'', {'x-ms-version': '2021-08-06'})
+    return {'store': 'azure', 'host': host, 'create_container': st, 'url': base + '?' + az_sas('hg-backups', account),
             'detail': text[:200]}
 
 

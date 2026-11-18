@@ -92,7 +92,7 @@ The installer records it and adapts: the off-site store that fits, the cost esti
 |---|---|---|---|---|---|
 | Detected by | IMDSv2 | `Metadata-Flavor: Google` | `Metadata: true` | `Bearer Oracle` | no metadata service |
 | Off-site copy | S3 | Cloud Storage (S3 interop) | Blob (SAS URL) | Object Storage (pre-authenticated URL or S3 API) | any S3-compatible store |
-| Tested in CI with | Floci, AWS Emulator | Floci GCP | Azurite, Floci Azure | Floci OCI | |
+| Tested in CI with | Floci, AWS Emulator | Floci GCP | Azurite | Floci OCI | |
 
 [docs/CLOUDS.md](docs/CLOUDS.md).
 

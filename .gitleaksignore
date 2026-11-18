@@ -1,2 +1,5 @@
 # The public RFC 6238 test vector in the panel tests (not a secret)
 9488ac5ac6785c92235bc4e7f68ea8398ade2393:panel/tests/test_panel.py:generic-api-key:16
+# Microsoft's documented Azurite development key, in one commit before CI made a random
+# key per run (public, never a secret of this project)
+7d88926bf0450abb0a55c04a8eb92800fcb79429:ci/clouds/probe_stores.py:generic-api-key:34

@@ -5,7 +5,8 @@
 #   AWS     Floci S3 (SigV4)                         BACKUP_REMOTE=s3
 #   GCP     Floci GCP Cloud Storage, S3 interop      BACKUP_REMOTE=s3, S3_ENDPOINT, AWS_REGION=auto
 #   Azure   Azurite (Microsoft's, checks every SAS)  BACKUP_REMOTE=azure, a container SAS URL
-#           and Floci Azure Blob
+#           (with a random account key per run; Floci's Azure emulator checks signatures only
+#           against its built-in public key, which would have to be written into the repository)
 #   OCI     Floci OCI Object Storage                 BACKUP_REMOTE=oci-par, a pre-authenticated URL
 #   other   no metadata service                      local backups only
 # Each run: hostguard whereami must name the cloud, a real backup (BACKUP_CMD, gpg AES-256)
@@ -21,10 +22,9 @@ OUT="${OUT:-$REPO/clouds-out}"
 NET=hg-clouds
 FLOCI=floci/floci@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be71956eb7a7fce08fc21458e19
 FLOCI_GCP=floci/floci-gcp@sha256:a59403d43d524b1a08282d67d541a6d37bf7868cbd9d1311caa0d2983adf6f46
-FLOCI_AZ=floci/floci-az@sha256:40f1bbf1ef13569c6eacb47e565bf4cd28785ca833208dcc074910e13aec64ea
 FLOCI_OCI=floci/floci-oci@sha256:088bb759252560921adf1776c9114e62b26ce589f267d4afb13f2ebba20e4a8c
 AZURITE=mcr.microsoft.com/azure-storage/azurite@sha256:647c63a91102a9d8e8000aab803436e1fc85fbb285e7ce830a82ee5d6661cf37
-STORES="floci floci-gcp floci-az floci-oci azurite"
+STORES="floci floci-gcp floci-oci azurite"
 mkdir -p "$OUT"
 printf '| Cloud | Detected | Off-site store | Backup confirmed | Restore test | Cost section |\n|---|---|---|---|---|---|\n' > "$OUT/results.md"
 fails=0
@@ -40,13 +40,14 @@ echo "==> network (169.254.169.0/24, so a container can be the metadata service)
 docker network create --subnet 169.254.169.0/24 --gateway 169.254.169.1 "$NET" >/dev/null
 docker run -d --name floci --network "$NET" "$FLOCI" >/dev/null
 docker run -d --name floci-gcp --network "$NET" "$FLOCI_GCP" >/dev/null
-docker run -d --name floci-az --network "$NET" "$FLOCI_AZ" >/dev/null
 docker run -d --name floci-oci --network "$NET" "$FLOCI_OCI" >/dev/null
-docker run -d --name azurite --network "$NET" "$AZURITE" azurite-blob --blobHost 0.0.0.0 >/dev/null
+AZ_ACCOUNT=hgtest
+AZ_KEY=$(head -c 64 /dev/urandom | base64 | tr -d '\n')      # a fresh storage account key for this run only
+docker run -d --name azurite --network "$NET" -e AZURITE_ACCOUNTS="$AZ_ACCOUNT:$AZ_KEY" "$AZURITE" azurite-blob --blobHost 0.0.0.0 >/dev/null
 printf 'FROM ubuntu:24.04\nRUN apt-get update -qq && apt-get install -y -qq python3 gnupg tar gzip ca-certificates >/dev/null && rm -rf /var/lib/apt/lists/*\n' \
   | docker build -q -t hg-cloud-target:local - >/dev/null
 docker run -d --name hgc-target --network "$NET" -v "$REPO:/src:ro" hg-cloud-target:local sleep infinity >/dev/null
-T() { docker exec hgc-target bash -c "$1"; }
+T() { docker exec -e AZ_ACCOUNT="$AZ_ACCOUNT" -e AZ_KEY="$AZ_KEY" hgc-target bash -c "$1"; }
 T 'install -m 0755 /src/guard/hostguard.py /usr/local/sbin/hostguard && mkdir -p /etc/host-guard && echo "important data $(date)" > /srv-data.txt'
 for _ in $(seq 30); do T 'python3 -c "import urllib.request as u; [u.urlopen(x, timeout=2) for x in (\"http://floci:4566/\",)]"' >/dev/null 2>&1 && break; sleep 1; done
 sleep 5
@@ -56,7 +57,6 @@ T "python3 -c \"import urllib.request; urllib.request.urlopen(urllib.request.Req
 S gcp store >/dev/null
 OCI_PATH=$(S oci accessUri)
 AZURITE_URL=$(S azurite:10000 url)
-FLOCI_AZ_URL=$(S floci-az:4577 url)
 
 run_cloud() {   # label provider settings...
   local label="$1" provider="$2"; shift 2
@@ -101,7 +101,6 @@ REMOTE_WANT=s3 run_cloud aws aws S3_BUCKET=hg-backups S3_ENDPOINT=http://floci:4
 REMOTE_WANT=s3 run_cloud gcp gcp S3_BUCKET=hg-backups S3_ENDPOINT=http://floci-gcp:4588 AWS_REGION=auto \
   AWS_ACCESS_KEY_ID=GOOG1EXAMPLEHMACKEY AWS_SECRET_ACCESS_KEY=hmac-secret
 REMOTE_WANT=azure run_cloud azure azure BACKUP_REMOTE=azure "BACKUP_REMOTE_URL=$AZURITE_URL"
-REMOTE_WANT=azure run_cloud azure-floci azure BACKUP_REMOTE=azure "BACKUP_REMOTE_URL=$FLOCI_AZ_URL"
 REMOTE_WANT=oci-par run_cloud oci oci BACKUP_REMOTE=oci-par "BACKUP_REMOTE_URL=http://floci-oci:4599$OCI_PATH"
 REMOTE_WANT='local only' run_cloud bare-metal none
 

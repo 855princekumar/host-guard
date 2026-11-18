@@ -84,10 +84,12 @@ restore test downloads, decrypts and unpacks it, and the cost section must not g
 |---|---|---|
 | AWS | [Floci](https://floci.io) S3, and [AWS Emulator](https://github.com/aws/aws-emulator) (AWS's own: real SigV4, per-run keys, HTTPS with its own CA) | a wrong secret is refused (403); without the CA, TLS refuses |
 | Google Cloud | Floci GCP Cloud Storage (XML API, S3 interoperability) | |
-| Azure | [Azurite](https://github.com/Azure/Azurite) (Microsoft's; checks every SAS signature) and Floci Azure | a forged SAS is refused (403) |
+| Azure | [Azurite](https://github.com/Azure/Azurite) (Microsoft's; checks every SAS signature, with a random account key made for each run) | a forged SAS is refused (403) |
 | Oracle Cloud | Floci OCI Object Storage, a real pre-authenticated request | |
 | VPS or bare metal | no metadata service, local backups | |
 
-Emulators are pinned by image digest. AWS Emulator publishes no image or pinned
+Floci's Azure emulator is not used: it checks signatures only against its built-in public
+development key, which would have to be written into the repository (and a secret scanner
+rightly flags it). Emulators are pinned by image digest. AWS Emulator publishes no image or pinned
 package (only LTS/latest), so CI prints its version, commit and package SHA-256 on every
 run and runs it with no network and telemetry off.
