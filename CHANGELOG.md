@@ -43,8 +43,8 @@
   report. P1 is never held. [docs/MAIL.md](docs/MAIL.md).
 - **Cloud CI** (`ci/clouds/run.sh`): on AWS, Google Cloud, Azure, Oracle Cloud and bare
   metal (metadata answered like each cloud's), a real backup goes off-site to an emulated
-  store (Floci for all four clouds, Azurite, and AWS's own AWS Emulator with real SigV4
-  checks over HTTPS) and is restore-tested; forged Azure signatures and wrong AWS secrets
+  store (Floci for AWS, Google Cloud and Oracle Cloud, Microsoft's Azurite with a random
+  key per run, and AWS's own AWS Emulator with real SigV4 checks over HTTPS) and is restore-tested; forged Azure signatures and wrong AWS secrets
   must be refused.
 - **Release gates**: a tag publishes to PyPI only after the whole CI (red team and clouds
   included), CodeQL, and a security audit report for that version with no open confirmed

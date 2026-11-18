@@ -631,7 +631,7 @@ def install_manager_copy(version):
     old = load_state().get('manager_version')
     if me != dst and (not old or parse_version(version) >= parse_version(old)):
         shutil.copyfile(me, dst + '.new')
-        os.chmod(dst + '.new', 0o644)
+        os.chmod(dst + '.new', 0o600)                    # root only, like everything in /opt/host-guard
         os.replace(dst + '.new', dst)
     wrapper = ('#!/bin/sh\n# host-guard manager (not tracked by rollbacks). A pip-installed host-guard wins.\n'
                'for c in /usr/local/bin/host-guard /opt/pipx/bin/host-guard; do\n'
@@ -640,8 +640,7 @@ def install_manager_copy(version):
     os.makedirs(os.path.dirname(R(WRAPPER)), exist_ok=True)
     with open(R(WRAPPER) + '.new', 'w', encoding='utf-8') as f:
         f.write(wrapper)
-    # a root-owned command must be executable by root
-    os.chmod(R(WRAPPER) + '.new', 0o755)  # nosec B103
+    os.chmod(R(WRAPPER) + '.new', 0o700)                  # only root runs it (sudo host-guard)
     os.replace(R(WRAPPER) + '.new', R(WRAPPER))
 
 
