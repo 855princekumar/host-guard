@@ -144,10 +144,48 @@ def test_five_wrong_codes_burn_it(hp):
     assert 'code burned' in [r[0] for r in hp.db().execute('SELECT event FROM audit')]
 
 
-def test_three_requests_per_address_in_ten_minutes(hp):
+def test_three_requests_per_browser_and_ten_per_address_in_ten_minutes(hp):
+    c = Client(hp)
     for _ in range(5):
-        assert Client(hp).ask().status == 200                                 # same answer every time
+        assert c.ask().status == 200                                          # same answer every time
     assert len([x for x in outbox(hp) if x['kind'] == 'code']) == 3
+    for _ in range(12):
+        assert Client(hp).ask().status == 200
+    assert len([x for x in outbox(hp) if x['kind'] == 'code']) == 7         # 10 per address in all
+
+
+def test_a_code_works_only_in_the_browser_that_asked_for_it(hp):
+    admin, other = Client(hp), Client(hp)
+    admin.ask()
+    code = outbox(hp)[0]['code']
+    other.ask()                                                               # does not replace the admin's code
+    outbox(hp)
+    for i in range(6):                                                        # nor burn it with wrong tries
+        other.code(str((int(code) + 1 + i) % 10 ** 6).zfill(6))
+    assert other.code(code).status == 401 and 'hg_s' not in other.jar         # the stolen code is useless there
+    assert admin.code(code).status == 303 and 'hg_s' in admin.jar
+
+
+def test_wrong_codes_still_count_while_guessing_is_blocked(hp):
+    for i in range(10):                                                       # trip the shared 127.0.0.1 block
+        c = Client(hp)
+        c.ask(f'guess{i}@example.org')
+        c.code('000000', f'guess{i}@example.org')
+    outbox(hp)
+    c = Client(hp)
+    c.ask()
+    code = outbox(hp)[0]['code']
+    for i in range(5):
+        assert 'Too many failed' in c.code(str((int(code) + 1 + i) % 10 ** 6).zfill(6)).text
+    assert c.code(code).status == 401                                         # burned, block or not
+
+
+def test_codes_take_ascii_digits_only(hp):
+    c = Client(hp)
+    c.ask()
+    code = outbox(hp)[0]['code']
+    arabic = ''.join(chr(0x660 + int(d)) for d in code)
+    assert c.code(arabic).status == 401
 
 
 def test_after_ten_failures_no_more_guesses_but_the_right_code_still_gets_in(hp):

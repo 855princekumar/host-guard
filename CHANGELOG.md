@@ -4,16 +4,18 @@
 
 ### Changed
 - **Dashboard sign-in by email, no password.** An admin types their email address and signs
-  in with the 6-digit code mailed to it: single use, 10 minutes, 5 wrong tries burn it, 3
-  requests per address in 10 minutes. The admins are the `--mail-to` addresses (`MAIL_TO`), or
+  in with the 6-digit code mailed to it: single use, 10 minutes, only in the browser that
+  asked for it, 5 wrong tries burn it, 3 requests per browser and 10 per address in 10 minutes. The admins are the `--mail-to` addresses (`MAIL_TO`), or
   `PANEL_ADMINS` when only some of them should see the dashboard. The panel answers every
   address the same way (it never learns who the admins are), and every sign-in is mailed to
   all admins. The password, the authenticator and `hgpanel init-admin` are gone; the old
   admin row is dropped from the panel's database on first start.
 - The panel still cannot read the mail password: it leaves the request in its own outbox and
   a root service (`host-guard-panel-mail.path` running `hostguard panel-outbox`) mails it,
-  only to an admin address, at most 5 per address in 15 minutes and 30 an hour, following no
-  link and removing every entry, so a panel that was taken over cannot mail anyone else.
+  only to an admin address, at most 5 codes per address in 15 minutes and 30 an hour (sign-in
+  notices: 5 per address and 20 an hour), working only inside the outbox it opened (no link
+  followed, by path or by folder), sandboxed by systemd, so a panel that was taken over cannot
+  mail anyone else or touch anything outside its outbox.
 - New mail category `Sign-in` (never held by flood protection).
 
 ### Added
@@ -21,6 +23,14 @@
   address enumeration (PANEL-18), code flooding (PANEL-19), a taken-over panel feeding the
   root mailer a code for an outsider, a link to `/etc/shadow`, a huge file and a folder
   (PANEL-20), the sign-in notice (PANEL-21); code guessing and replay rewritten for codes.
+
+### Security
+- Audit of the changes ([docs/audits/0.4.0.md](docs/audits/0.4.0.md)), all fixed before release:
+  a taken-over panel could swap its outbox for a link and make the root mailer empty any folder;
+  wrong codes stopped counting once the shared failure block tripped; a visitor could replace or
+  burn an admin's code (codes are now bound to the browser that asked); sign-in notices had no
+  limit.
+- 0.3.1 was not published on its own: its changes ship in 0.4.0.
 
 ## [0.3.1] - 2026-11-19
 

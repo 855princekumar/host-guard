@@ -52,7 +52,7 @@ DEFAULTS = {
     'DB': '/var/lib/host-guard-panel/panel.db', 'STATUS_FILE': '/var/lib/host-guard-export/status.json',
     'OUTBOX': '/var/lib/host-guard-panel/outbox',
     'COOKIE_SECURE': '1', 'IDLE_MIN': '15', 'MAX_HOURS': '8',
-    'CODE_MIN': '10', 'CODE_TRIES': '5', 'CODE_REQUESTS': '3', 'LOCK_MIN': '15', 'IP_LIMIT': '10',
+    'CODE_MIN': '10', 'CODE_TRIES': '5', 'CODE_REQUESTS': '3', 'CODE_REQUESTS_ALL': '10', 'LOCK_MIN': '15', 'IP_LIMIT': '10',
 }
 MAX_BODY = 8192
 EMAIL = re.compile(r'^[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}$')
@@ -86,9 +86,9 @@ C = conf()
 # ---------------------------------------------------------------- database
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS codes (
-  email TEXT PRIMARY KEY, salt TEXT NOT NULL, code_hash TEXT NOT NULL, created REAL NOT NULL,
-  tries INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS requests (email TEXT NOT NULL, at REAL NOT NULL);
+  email TEXT NOT NULL, owner TEXT NOT NULL, salt TEXT NOT NULL, code_hash TEXT NOT NULL, created REAL NOT NULL,
+  tries INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (email, owner));
+CREATE TABLE IF NOT EXISTS requests (email TEXT NOT NULL, owner TEXT NOT NULL DEFAULT '', at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT PRIMARY KEY, csrf TEXT NOT NULL, created REAL NOT NULL, seen REAL NOT NULL, ip TEXT NOT NULL,
   email TEXT NOT NULL DEFAULT '');
@@ -98,6 +98,8 @@ CREATE INDEX IF NOT EXISTS failures_ip ON failures (ip, at);
 CREATE INDEX IF NOT EXISTS requests_email ON requests (email, at);
 '''
 _lock = threading.Lock()
+CODE_RE = re.compile(r'[0-9]{6}')                               # ASCII digits only (str.isdigit takes any script)
+AUDIT_ROWS = 100_000
 
 
 def db():
@@ -105,6 +107,10 @@ def db():
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     con = sqlite3.connect(path, timeout=10, isolation_level=None)
     con.execute('PRAGMA journal_mode=WAL')
+    for table in ('codes', 'requests'):                         # 0.4.0 drafts: codes were not bound to a browser
+        have = [r[1] for r in con.execute(f'PRAGMA table_info({table})')]
+        if have and 'owner' not in have:
+            con.execute(f'DROP TABLE {table}')
     con.executescript(SCHEMA)
     cols = [r[1] for r in con.execute('PRAGMA table_info(sessions)')]
     if 'email' not in cols:                                     # a panel database from before 0.4
@@ -120,6 +126,7 @@ def db():
 def audit(con, ip, event, detail=''):
     con.execute('INSERT INTO audit (at, ip, event, detail) VALUES (?, ?, ?, ?)', (time.time(), ip, event, detail[:200]))
     con.execute('DELETE FROM audit WHERE at < ?', (time.time() - 180 * 86400,))      # 180 days kept
+    con.execute('DELETE FROM audit WHERE rowid <= (SELECT MAX(rowid) FROM audit) - ?', (AUDIT_ROWS,))  # and at most this many
 
 
 # ---------------------------------------------------------------- the outbox (read by the root mailer)
@@ -146,9 +153,14 @@ def norm(email):
     return e if EMAIL.match(e) else ''
 
 
-def request_code(con, ip, email):
+def request_code(con, ip, email, owner):
     """Make a code for this address and hand it to the mailer. Returns the message shown,
-    the same for every address (the panel does not know who the admins are)."""
+    the same for every address (the panel does not know who the admins are).
+
+    The code belongs to the browser that asked (`owner`, the hash of its hg_ask cookie): only
+    that browser can use it, so another visitor can neither replace an admin's code nor burn it
+    with wrong tries. Limits: CODE_REQUESTS per browser and address, CODE_REQUESTS_ALL per
+    address in 10 minutes (the root mailer adds 5 per address in 15 minutes)."""
     msg = 'If this address belongs to an admin of this server, a code is on its way. It works once, for 10 minutes.'
     e = norm(email)
     if not e:
@@ -156,15 +168,17 @@ def request_code(con, ip, email):
     with _lock:
         t = time.time()
         con.execute('DELETE FROM requests WHERE at < ?', (t - 600,))
-        n = con.execute('SELECT COUNT(*) FROM requests WHERE email = ?', (e,)).fetchone()[0]
-        if n >= int(C['CODE_REQUESTS']):
+        con.execute('DELETE FROM codes WHERE created < ?', (t - float(C['CODE_MIN']) * 60,))
+        mine = con.execute('SELECT COUNT(*) FROM requests WHERE email = ? AND owner = ?', (e, owner)).fetchone()[0]
+        every = con.execute('SELECT COUNT(*) FROM requests WHERE email = ?', (e,)).fetchone()[0]
+        if mine >= int(C['CODE_REQUESTS']) or every >= int(C['CODE_REQUESTS_ALL']):
             audit(con, ip, 'code throttled', e)
             return True, msg                                     # same answer; no new code
         code = str(secrets.randbelow(10 ** 6)).zfill(6)
         salt = secrets.token_hex(16)
-        con.execute('INSERT OR REPLACE INTO codes (email, salt, code_hash, created, tries) VALUES (?, ?, ?, ?, 0)',
-                    (e, salt, sha(salt + code), t))
-        con.execute('INSERT INTO requests (email, at) VALUES (?, ?)', (e, t))
+        con.execute('INSERT OR REPLACE INTO codes (email, owner, salt, code_hash, created, tries) VALUES (?, ?, ?, ?, ?, 0)',
+                    (e, owner, salt, sha(salt + code), t))
+        con.execute('INSERT INTO requests (email, owner, at) VALUES (?, ?, ?)', (e, owner, t))
         audit(con, ip, 'code requested', e)
     outbox('code', e, code=code, ip=ip)
     return True, msg
@@ -177,33 +191,36 @@ def ip_blocked(con, ip):
     return n >= int(C['IP_LIMIT'])
 
 
-def sign_in(con, ip, email, code):
+def sign_in(con, ip, email, code, owner):
     """Returns (session token or None, message). The code is single use: it is deleted on
-    success, and burned after CODE_TRIES wrong tries or CODE_MIN minutes."""
+    success, and burned after CODE_TRIES wrong tries or CODE_MIN minutes. Only the browser
+    that asked for it (`owner`) can use it."""
     generic = 'That code is not valid. Ask for a new one.'
     e = norm(email)
     code = (code or '').strip()
     with _lock:
         blocked = ip_blocked(con, ip)
-        row = con.execute('SELECT salt, code_hash, created, tries FROM codes WHERE email = ?', (e,)).fetchone() if e else None
+        row = con.execute('SELECT salt, code_hash, created, tries FROM codes WHERE email = ? AND owner = ?',
+                          (e, owner)).fetchone() if e and owner else None
         fresh = bool(row) and time.time() - row[2] <= float(C['CODE_MIN']) * 60 and row[3] < int(C['CODE_TRIES'])
-        good = fresh and len(code) == 6 and code.isdigit() and hmac.compare_digest(sha(row[0] + code), row[1])
-        if blocked and not good:
-            # Every visitor arrives as 127.0.0.1 through the tunnel, so this counter is shared:
-            # it slows guessing, but the right code always gets in.
-            audit(con, ip, 'blocked', 'too many failures from this address')
-            return None, 'Too many failed sign-ins. Try again later.'
+        good = fresh and CODE_RE.fullmatch(code) is not None and hmac.compare_digest(sha(row[0] + code), row[1])
         if not good:
+            # every wrong try counts against the code, blocked or not: CODE_TRIES and it is gone
             con.execute('INSERT INTO failures (ip, at) VALUES (?, ?)', (ip, time.time()))
             if row:
                 if fresh and row[3] + 1 < int(C['CODE_TRIES']):
-                    con.execute('UPDATE codes SET tries = tries + 1 WHERE email = ?', (e,))
+                    con.execute('UPDATE codes SET tries = tries + 1 WHERE email = ? AND owner = ?', (e, owner))
                 else:
-                    con.execute('DELETE FROM codes WHERE email = ?', (e,))          # burned
+                    con.execute('DELETE FROM codes WHERE email = ? AND owner = ?', (e, owner))     # burned
                     audit(con, ip, 'code burned', e)
+            if blocked:
+                # Every visitor arrives as 127.0.0.1 through the tunnel, so this counter is shared:
+                # it slows guessing, but the right code always gets in.
+                audit(con, ip, 'blocked', 'too many failures from this address')
+                return None, 'Too many failed sign-ins. Try again later.'
             audit(con, ip, 'sign-in failed', e or '(no address)')
             return None, generic
-        con.execute('DELETE FROM codes WHERE email = ?', (e,))                        # single use
+        con.execute('DELETE FROM codes WHERE email = ? AND owner = ?', (e, owner))       # single use
         audit(con, ip, 'sign-in', e)
         token = new_session(con, ip, e)
     outbox('signed-in', e, ip=ip)
@@ -416,6 +433,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.do_GET()
 
+    def asker(self, cookies):
+        """The hg_ask cookie names the browser a code belongs to; a new one if it has none."""
+        ask = cookies.get('hg_ask', '')
+        if not re.fullmatch(r'[A-Za-z0-9_-]{32,64}', ask):
+            ask = secrets.token_urlsafe(32)
+        return sha('ask:' + ask), self.cookie('hg_ask', ask, int(float(C['CODE_MIN']) * 60) + 300)
+
     def fresh_pre(self):
         pre = secrets.token_urlsafe(24)
         return pre, [self.cookie('hg_pre', pre, 900)]
@@ -482,18 +506,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return self.send(403, b'form expired, reload the page', 'text/plain')
                 new_pre, ck = self.fresh_pre()
                 email = norm(f.get('email'))
+                owner, ask_cookie = self.asker(cookies)
                 if route == '/login':
-                    ok, msg = request_code(con, self.ip(), f.get('email', ''))
+                    ok, msg = request_code(con, self.ip(), f.get('email', ''), owner)
                     if not ok:
                         return self.send(400, email_page(new_pre, msg), cookies=ck)
-                    return self.send(200, code_page(new_pre, email, msg), cookies=ck)
-                token, msg = sign_in(con, self.ip(), email, f.get('code', ''))
+                    return self.send(200, code_page(new_pre, email, msg), cookies=ck + [ask_cookie])
+                token, msg = sign_in(con, self.ip(), email, f.get('code', ''), owner if 'hg_ask' in cookies else '')
                 if not token:
                     return self.send(401, code_page(new_pre, email, err=msg), cookies=ck)
                 old = get_session(con, cookies.get('hg_s'))
                 if old:
                     con.execute('DELETE FROM sessions WHERE token_hash = ?', (old['hash'],))
-                return self.send(303, cookies=[self.cookie('hg_s', token), self.cookie('hg_pre', '', 0)], location='/')
+                return self.send(303, cookies=[self.cookie('hg_s', token), self.cookie('hg_pre', '', 0),
+                                               self.cookie('hg_ask', '', 0)], location='/')
             sess = get_session(con, cookies.get('hg_s'))
             if not sess or not hmac.compare_digest(sess['csrf'].encode(), (f.get('csrf') or '').encode()):
                 audit(con, self.ip(), 'csrf', route)
