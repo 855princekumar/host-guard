@@ -150,7 +150,11 @@ jobs:
           v="$(cat VERSION)"
           docker run --rm ${{ matrix.os }} bash -c "apt-get update -qq >/dev/null && apt-get install -y -qq pipx python3 >/dev/null 2>&1
             export PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin
-            pipx install host-guard==$v >/dev/null && host-guard version | grep -qx '$v' && echo 'pipx install host-guard==$v: ok'"
+            for i in 1 2 3 4 5 6 7 8 9 10; do                # the index CDN can lag the JSON API for minutes
+              PIP_NO_CACHE_DIR=1 pipx install host-guard==$v >/dev/null 2>&1 && break
+              echo \"host-guard==$v not on this index edge yet (try \$i of 10)\"; sleep 30
+            done
+            host-guard version | grep -qx '$v' && echo 'pipx install host-guard==$v: ok'"
       - name: The whole lifecycle with the file downloaded from PyPI
         run: docker run --rm -v "$PWD:/src:ro" -v "$PWD/pypi-dist:/dist:ro" ${{ matrix.os }} bash /src/ci/lifecycle.sh
 
