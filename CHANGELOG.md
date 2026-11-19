@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.3.1] - 2026-11-19
+
+### Added
+- **The package checks itself**: before anything runs as root, the version manager compares
+  every file of its pip install with the package's SHA-256 RECORD; a changed or added file
+  stops it with the command to reinstall.
+- **Published = tested**: CI builds the wheel once (reproducibly) and audits it
+  (`ci/package_audit.py`: contents, no drift from the repository, RECORD, metadata with no
+  dependencies, archive safety, secrets, a smoke install that must refuse a tampered file);
+  the red team, the cloud emulators and the lifecycle all run on that wheel; the release
+  publishes that same file, then checks byte for byte that PyPI serves it, that its
+  provenance attestation names this repository's `release.yml`, and installs it from PyPI on
+  three systems ([docs/RELEASING.md](docs/RELEASING.md)).
+- Red team: 5 attacks on the pip package (PKG-1 to PKG-5): a tampered or planted file in the
+  installed package is refused before anything runs as root; no dependencies, no `.pth` file
+  that runs code, nothing writable by non-root users.
+
+### Changed
+- The release publishes the wheel and sdist CI built and tested (no second build), attaches
+  `SHA256SUMS` to the GitHub release, and only then creates it.
+
 ## [0.3.0] - 2026-11-19
 
 ### Added
