@@ -104,7 +104,7 @@ def check_wheel(wheel, version):
         if n not in listed:
             fail(f'RECORD: {n} is in the wheel but not in RECORD')
     meta = data[info + 'METADATA'].decode()
-    field = lambda k: re.findall(rf'^{k}: (.*)$', meta, re.M)       # noqa: E731
+    field = lambda k: re.findall(rf'^{k}: (.*)$', meta, re.M | re.I)       # noqa: E731
     expect = {'Name': ['host-guard'], 'Version': [version], 'Requires-Python': ['>=3.10'], 'License-Expression': ['MIT']}
     for k, v in expect.items():
         if field(k) != v:
@@ -123,6 +123,8 @@ def check_wheel(wheel, version):
             have[n[len('host_guard/payload/'):]] = b
         elif n.startswith('host_guard/') and n.count('/') == 1:
             have['../' + n.split('/', 1)[1]] = b
+        elif not n.startswith(info):
+            fail(f'wheel: {n} maps to nothing in the repository')          # e.g. host_guard/manager/__init__.py
     for p in sorted(set(want) | set(have)):
         if p not in have:
             fail(f'drift: {p} is in the repository but not in the wheel')

@@ -53,17 +53,21 @@ for name, want in local.items():
     got = hashlib.sha256(body).hexdigest()
     if got != want:
         problems.append(f'{name}: the file PyPI serves has sha256 {got}, CI tested {want}')
+        continue                                            # never handed to the install tests
     with open(os.path.join(out, name), 'wb') as f:
         f.write(body)
+    attested = False
     try:
         prov = json.loads(get(f'https://pypi.org/integrity/host-guard/{version}/{name}/provenance'))
         pubs = [b.get('publisher', {}) for b in prov.get('attestation_bundles', [])]
         ok = any(p.get('kind') == 'GitHub' and p.get('repository') == REPO and p.get('workflow') == 'release.yml' for p in pubs)
         if not ok:
             problems.append(f'{name}: provenance publisher is {pubs}, expected GitHub {REPO} release.yml')
+        attested = ok
     except Exception as e:
         problems.append(f'{name}: no provenance attestation ({e})')
-    print(f'{name}: sha256 {want} on PyPI and in the downloaded file; attested by {REPO} release.yml')
+    print(f'{name}: sha256 {want} on PyPI and in the downloaded file'
+          + (f'; attested by {REPO} release.yml' if attested else '; NOT attested'))
 for p in problems:
     print('FAIL', p)
 sys.exit(1 if problems else 0)

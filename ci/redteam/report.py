@@ -10,7 +10,8 @@ rows = [json.loads(line) for line in open(os.path.join(out, 'results.jsonl'), en
 PHASES = [('SSH', 'SSH: initial access'), ('WEB', 'Web: probing and flooding'),
           ('HOST', 'Host: persistence, privilege, miners'), ('NET', 'Network: egress and scanning'),
           ('BAK', 'Backups: confidentiality and integrity'), ('SEC', 'Secrets'), ('GUI', 'Panel in a real browser'),
-          ('PANEL', 'Panel: web attacks (raw HTTP and a hostile page in the same browser)')]
+          ('PANEL', 'Panel: web attacks (raw HTTP and a hostile page in the same browser)'),
+          ('PKG', 'The pip package (supply chain)')]
 ICON = {'PASS': 'stopped', 'GAP': 'gap', 'FAIL': '**FAILED**'}
 n = {k: sum(r['result'] == k for r in rows) for k in ('PASS', 'GAP', 'FAIL')}
 
