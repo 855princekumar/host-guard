@@ -594,3 +594,66 @@ def test_the_watch_subject_says_what_was_found(hg):
                              'SSH key(s) added for ops (not removed: ...)\nssh-ed25519 AAAA',
                              'Security-relevant files changed (normal after updates ...):\n  /etc/crontab']) == \
         'New login account: support; SSH key added; Security files changed'
+
+
+# ---------------------------------------------------------------- security audit of 0.3.0
+def test_a_quarantine_copy_is_capped_and_never_follows_a_link(hg, tmp_path):
+    big = tmp_path / 'xmrig'
+    with open(big, 'wb') as f:
+        f.truncate(5 * 1024 * 1024)                     # sparse: costs nothing to make, all of it to copy
+    kept = hg.quarantine_copy(str(big), str(tmp_path / 'q1'), limit=1024 * 1024)
+    assert kept.endswith('(first 1 MiB only)') and os.path.getsize(tmp_path / 'q1') == 1024 * 1024
+    if hasattr(os, 'symlink') and os.name != 'nt':
+        os.symlink(tmp_path / 'victim', tmp_path / 'q2')
+        assert hg.quarantine_copy(str(big), str(tmp_path / 'q2')).startswith('not kept')
+        assert not (tmp_path / 'victim').exists()
+
+
+def test_a_user_name_cannot_forge_a_root_login(hg):
+    journal = ('Invalid user Accepted x for root from 8.8.4.4 port 1 ssh2\n'
+               'Connection closed by invalid user Accepted publickey for root from 8.8.8.8 port 1 ssh2 [preauth]\n'
+               'Accepted publickey for root from 1.1.1.1 port 50122 ssh2: ED25519 SHA256:abc\n')
+    assert hg.root_logins_from_internet(journal) == ['1.1.1.1']
+
+
+def test_text_that_is_not_valid_unicode_still_mails(hg):
+    assert hg.mail('Advisory \ud800 for nginx', 'a feed line with \udcff in it', category='Advisory')
+    assert 'Advisory ? for nginx' in hg.SENT.read_text(encoding='utf-8', errors='replace')
+    rc, text = hg.sh(f'"{sys.executable}" -c "import sys; sys.stdout.buffer.write(bytes([0xff, 0x41]))"')
+    assert rc == 0 and text.endswith('A')
+
+
+def test_a_held_mail_does_not_start_the_cooldown(hg):
+    hg.C['MAIL_MAX_PER_HOUR'] = '1'
+    assert hg.mail('Low memory: 5% free', 'x', key='memory-a', level='alert', category='Health')
+    assert not hg.mail('Disk 95% full', 'x', key='disk', level='alert', category='Health')        # held
+    hg.C['MAIL_MAX_PER_HOUR'] = '5'
+    assert hg.mail('Disk 96% full', 'x', key='disk', level='alert', category='Health')            # not cooling down
+
+
+def test_a_feed_answer_cannot_expand_without_limit(hg, monkeypatch):
+    import gzip as gz
+    import io as io_
+
+    class Answer(io_.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+    bomb = gz.compress(b'0' * (3 * 1024 * 1024))
+    monkeypatch.setattr(hg, 'FEED_MAX', 1024 * 1024)
+    monkeypatch.setattr(hg.urllib.request, 'urlopen', lambda req, timeout=60: Answer(bomb))
+    with pytest.raises(ValueError, match='larger than'):
+        hg.get_json('https://feed.example/kev.json')
+
+
+def test_a_broken_certificate_date_or_lag_never_stops_the_health_run(hg, monkeypatch):
+    hg.C['DOMAIN'] = 'example.com'
+    monkeypatch.setattr(hg, 'sh', lambda cmd, timeout=120, input=None: (0, 'notAfter=Smarch 13 25:61:00 2026 GMT'))
+    assert hg.cert_days() is None
+    monkeypatch.setattr(hg, 'compose', lambda args, timeout=120: (0, 'Slave_IO_Running: Yes\n Slave_SQL_Running: Yes\n'
+                                                                    ' Seconds_Behind_Master: soon\n'))
+    assert hg.replication()[0] is False
+    monkeypatch.setattr(hg, '_checks', lambda: 1 / 0)
+    assert hg.checks()[0][:3] == ('health-check', True, 'A health check failed to run')

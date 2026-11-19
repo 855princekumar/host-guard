@@ -132,11 +132,14 @@ def test_five_failures_lock_the_account(hp):
     assert 'lockout' in events and 'locked' in events
 
 
-def test_one_address_is_blocked_after_ten_failures(hp):
+def test_after_ten_failures_an_address_gets_no_more_guesses_but_the_admin_still_gets_in(hp):
+    # every visitor comes through the tunnel as 127.0.0.1: the block must slow guessing
+    # without letting anyone lock the real admin out
     hp.C['LOCK_AFTER'] = '100'
     for _ in range(10):
         Client(hp).login(user='nobody')
-    assert 'Too many failed sign-ins' in Client(hp).login().text
+    assert 'Too many failed sign-ins' in Client(hp).login(pw='still guessing').text
+    assert Client(hp).login().status == 303
 
 
 def test_forms_need_their_csrf_token(hp):
@@ -216,3 +219,24 @@ def test_a_browser_sending_origin_null_is_judged_by_sec_fetch_site(hp):
     assert c.req('POST', '/logout', {'csrf': token}, {'Origin': 'null'}).status == 403            # no proof
     assert c.req('POST', '/logout', {'csrf': token}, {'Origin': 'null', 'Sec-Fetch-Site': 'same-site'}).status == 403
     assert c.req('POST', '/logout', {'csrf': token}, {'Origin': 'null', 'Sec-Fetch-Site': 'same-origin'}).status == 303
+
+
+def test_a_negative_or_signed_length_is_refused_before_any_body_is_read(hp):
+    """Audit 0.3.0: Content-Length: -1 passed the size check and the whole stream was read."""
+    import socket
+    for length in ('-1', '+5', ' 99999999', '1e9'):
+        s = socket.create_connection(('127.0.0.1', int(hp.C['PORT'])), timeout=10)
+        s.sendall(f'POST /login HTTP/1.1\r\nHost: 127.0.0.1:{hp.C["PORT"]}\r\n'
+                  f'Content-Type: application/x-www-form-urlencoded\r\nContent-Length: {length}\r\n\r\n'.encode())
+        assert s.recv(64).split(b' ')[1] in (b'400', b'403'), length
+        s.close()
+
+
+def test_the_audit_listing_prints_no_terminal_control_characters(hp, capsys):
+    con = hp.db()
+    hp.audit(con, '127.0.0.1', 'cross-site post', 'https://evil.example\x1b]0;owned\x07\x1b[2J')
+    con.close()
+    hp.main(['audit'])
+    out = capsys.readouterr().out
+    assert 'evil.example' in out
+    assert '\x1b' not in out and '\x07' not in out

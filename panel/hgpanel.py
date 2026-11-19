@@ -14,7 +14,8 @@ Security model
     STATUS_FILE, which `hostguard export` writes without secrets.
   * One admin (the table cannot hold two). Password hashed with scrypt, second factor
     TOTP (RFC 6238) with replay protection; 5 failures lock the account for 15 minutes,
-    10 failures from one address in 15 minutes block that address.
+    10 failures from one address in 15 minutes block further guesses from it
+    (the right name, password and code still get in).
   * Sessions: random 256-bit token, only its SHA-256 is stored; HttpOnly, SameSite=Strict,
     Secure; 15 minutes idle, 8 hours at most; a new token at every sign-in.
   * Every form carries a CSRF token; every query is parameterized; every value shown is
@@ -107,6 +108,7 @@ def db():
 
 def audit(con, ip, event, detail=''):
     con.execute('INSERT INTO audit (at, ip, event, detail) VALUES (?, ?, ?, ?)', (time.time(), ip, event, detail[:200]))
+    con.execute('DELETE FROM audit WHERE at < ?', (time.time() - 180 * 86400,))      # 180 days kept
 
 
 # ---------------------------------------------------------------- passwords and TOTP
@@ -191,9 +193,7 @@ def sign_in(con, ip, username, password, code):
     """Returns (session token or None, message). The message never says which part was wrong."""
     generic = 'Sign-in failed. Check the name, password and code.'
     with _lock:
-        if ip_blocked(con, ip):
-            audit(con, ip, 'blocked', 'too many failures from this address')
-            return None, 'Too many failed sign-ins from this address. Try again later.'
+        blocked = ip_blocked(con, ip)
         row = con.execute('SELECT username, pw_hash, totp_secret, totp_last_step, failed, locked_until '
                           'FROM admin WHERE id = 1').fetchone()
         name_ok = bool(row) and hmac.compare_digest((username or '').encode(), row[0].encode())
@@ -202,6 +202,11 @@ def sign_in(con, ip, username, password, code):
             audit(con, ip, 'locked', 'sign-in while the account is locked')
             return None, generic
         step = totp_step_ok(row[2], code or '', row[3]) if pw_ok else None
+        if blocked and not step:
+            # Every visitor arrives as 127.0.0.1 through the tunnel, so this counter is shared:
+            # it slows guessing, but the right name, password and code always get in.
+            audit(con, ip, 'blocked', 'too many failures from this address')
+            return None, 'Too many failed sign-ins from this address. Try again later.'
         if not step:
             con.execute('INSERT INTO failures (ip, at) VALUES (?, ?)', (ip, time.time()))
             if row and name_ok:
@@ -331,6 +336,7 @@ def allowed_hosts():
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = 'host-guard'
     sys_version = ''
+    timeout = 20                                          # a slow or stalled client is dropped
 
     def log_message(self, fmt, *args):                    # no query strings or cookies in logs
         sys.stderr.write(f'{self.client_address[0]} {self.command} {urllib.parse.urlsplit(self.path).path}\n')
@@ -374,11 +380,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return (self.headers.get('Host') or '').lower() in allowed_hosts()
 
     def form(self):
-        try:
-            n = int(self.headers.get('Content-Length') or 0)
-        except ValueError:
+        raw = (self.headers.get('Content-Length') or '0').strip()
+        if not raw.isdigit() or int(raw) > MAX_BODY:     # no negative, signed or huge length
             return None
-        if n > MAX_BODY or (self.headers.get('Content-Type') or '').split(';')[0] != 'application/x-www-form-urlencoded':
+        n = int(raw)
+        if (self.headers.get('Content-Type') or '').split(';')[0] != 'application/x-www-form-urlencoded':
             return None
         data = urllib.parse.parse_qs(self.rfile.read(n).decode('utf-8', 'replace'), max_num_fields=10)
         return {k: v[0] for k, v in data.items()}
@@ -517,7 +523,7 @@ def main(argv):
     elif argv and argv[0] == 'audit':
         n = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else 50
         for a, i, e, d in db().execute('SELECT at, ip, event, detail FROM audit ORDER BY at DESC LIMIT ?', (n,)):
-            print(when(a), i, e, d)
+            print(*(''.join(ch if ch.isprintable() else '?' for ch in str(x)) for x in (when(a), i, e, d)))   # no terminal escapes
     else:
         print(__doc__)
         sys.exit(2)

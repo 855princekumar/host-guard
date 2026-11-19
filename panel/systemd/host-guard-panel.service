@@ -11,6 +11,8 @@ RestartSec=5
 UMask=0077
 # The panel can write only its own folder (its SQLite file) and reads the exported status.
 ReadWritePaths=/var/lib/host-guard-panel
+MemoryMax=256M
+TasksMax=64
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true

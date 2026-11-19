@@ -60,7 +60,7 @@ signed in through the panel's own form), with the red team's attack traffic in t
 | Secrets | cannot read `/etc/host-guard`, `/var/lib/host-guard` or the backups (also blocked in the unit); root's `hostguard export` writes a status file without secrets into a folder the panel can read but not write |
 | Admins | the table holds one row; password hashed with scrypt (N=2^15) |
 | Second factor | TOTP (RFC 6238), 30 s steps, a code works once (replay refused) |
-| Guessing | 5 failures lock the account for 15 minutes; 10 failures from one address in 15 minutes block that address; the message never says which part was wrong |
+| Guessing | 5 failures lock the account for 15 minutes; 10 failures from one address in 15 minutes block further guesses from it (every visitor arrives through the tunnel as 127.0.0.1, so the right name, password and code still get in: nobody can lock the admin out this way); the message never says which part was wrong |
 | Sessions | 256-bit random token, only its SHA-256 stored; cookie HttpOnly, SameSite=Strict, Secure; 15 minutes idle, 8 hours at most; a new token at every sign-in |
 | Web | a CSRF token on every form; parameterized SQL only; every value HTML-escaped; Content-Security-Policy `default-src 'none'` (no script at all); no framing; `no-store`; 8 KB request limit |
 | Cross-site | a form post whose `Origin` is another site, or that the browser marks `Sec-Fetch-Site: cross-site`, is refused and audited; no CORS header is ever sent |
