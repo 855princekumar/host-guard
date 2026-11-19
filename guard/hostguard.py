@@ -45,6 +45,7 @@ import glob
 import gzip
 import hashlib
 import hmac
+import io
 import ipaddress
 import json
 import os
@@ -205,7 +206,8 @@ def save(data, name='state.json'):
 def sh(cmd, timeout=120, input=None):
     """Run a shell command; returns (exit code, stdout+stderr text). Never raises."""
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, input=input)  # nosec B602
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, encoding='utf-8', errors='replace',  # nosec B602
+                           timeout=timeout, input=input)
         return r.returncode, (r.stdout + r.stderr).strip()
     except subprocess.TimeoutExpired:
         return 124, f'timed out after {timeout}s: {cmd[:80]}'
@@ -348,6 +350,9 @@ def _held(log, category):
     return [h for h in log.get('held', []) if h['category'] == category and h['at'] > hour]
 
 
+MAIL_BODY_MAX = 200_000
+
+
 def mail(subject, body, key=None, level='info', category=None):
     """Send one mail. With a key, the same problem mails at most once per COOLDOWN_H
     hours; resolved() clears it. P2 and P3 mails of one category are limited to
@@ -355,13 +360,12 @@ def mail(subject, body, key=None, level='info', category=None):
     and in the daily report. P1 (critical), resolved and daily mails always go out.
     Returns True when a mail went out."""
     category = category or KEY_CATEGORY.get((key or '').split(':')[0]) or 'Health'
+    subject, body = (str(x).encode('utf-8', 'replace').decode('utf-8') for x in (subject, body))   # no lone surrogates
+    if len(body) > MAIL_BODY_MAX:             # thousands of planted processes must not make a mail too big to deliver
+        body = body[:MAIL_BODY_MAX] + f'\n\n(cut at {MAIL_BODY_MAX // 1000} KB; the rest is in {C["STATE_DIR"]})'
     alerts = load('alerts.json')
-    if key:
-        last = alerts.get(key, {}).get('at', 0)
-        if now() - last < float(C['COOLDOWN_H']) * 3600:
-            return False
-        alerts[key] = {'at': now(), 'subject': subject, 'category': category, 'level': level}
-        save(alerts, 'alerts.json')
+    if key and now() - alerts.get(key, {}).get('at', 0) < float(C['COOLDOWN_H']) * 3600:
+        return False
     subject = re.sub(r'[\r\n]+', ' ', subject)                     # never a second header
     log = load('mail-log.json')
     if level in ('alert', 'info') and category not in NEVER_HELD:
@@ -376,6 +380,9 @@ def mail(subject, body, key=None, level='info', category=None):
             save(log, 'mail-log.json')
             print(f'(held: {category} already mailed {len(recent)} times this hour) {subject}')
             return False
+    if key:                                   # the cooldown starts with a mail that went out, not a held one
+        alerts[key] = {'at': now(), 'subject': subject, 'category': category, 'level': level}
+        save(alerts, 'alerts.json')
     held = _held(log, category)
     if held:
         body += (f'\n\n== Held back in the last hour ({len(held)} similar mail(s), flood protection)\n'
@@ -480,7 +487,7 @@ def replication():
         return None, 'no replication configured'
     io_ok, sql_ok = f.get('Slave_IO_Running', f.get('Replica_IO_Running')), f.get('Slave_SQL_Running', f.get('Replica_SQL_Running'))
     lag = f.get('Seconds_Behind_Master', f.get('Seconds_Behind_Source'))
-    ok = io_ok == 'Yes' and sql_ok == 'Yes' and lag not in (None, 'NULL') and int(lag) <= int(C['LAG_WARN'])
+    ok = io_ok == 'Yes' and sql_ok == 'Yes' and (lag or '').isdigit() and int(lag) <= int(C['LAG_WARN'])
     detail = f'IO {io_ok}, SQL {sql_ok}, {lag} s behind'
     if f.get('Last_Error'):
         detail += ', last error: ' + f['Last_Error'][:160]
@@ -509,7 +516,10 @@ def cert_days():
     m = re.search(r'notAfter=(.*)', text)
     if not m:
         return None
-    end = dt.datetime.strptime(m.group(1).strip().replace('  ', ' '), '%b %d %H:%M:%S %Y %Z')
+    try:
+        end = dt.datetime.strptime(m.group(1).strip().replace('  ', ' '), '%b %d %H:%M:%S %Y %Z')
+    except ValueError:
+        return None
     return (end - dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)).days
 
 
@@ -521,6 +531,15 @@ def https_code():
 
 
 def checks():
+    """Each check: (key, problem or None, subject, details). A check that crashes is reported
+    as its own problem; the other checks and their mails still run."""
+    try:
+        return _checks()
+    except Exception as e:
+        return [('health-check', True, 'A health check failed to run', f'{type(e).__name__}: {str(e)[:300]}')]
+
+
+def _checks():
     """Each check: (key, problem or None, subject, details)."""
     res = []
     free = mem_free_pct()
@@ -673,9 +692,11 @@ def root_logins_from_internet(journal):
     """Addresses of root SSH logins from public addresses, from sshd's "Accepted ... for root
     from ADDRESS" lines only. Anything else in the text (a loader warning while
     /etc/ld.so.preload points at a missing library mentions "from /etc/ld.so.preload") is
-    not a login."""
+    not a login. The journal is read with -o cat, so sshd's own line starts with "Accepted":
+    a user name an attacker chose ("Invalid user Accepted x for root from ...") never does."""
     found = []
-    for m in re.finditer(r'Accepted \S+ for root from (\S+) port \d+', journal):
+    for m in re.finditer(r'^Accepted (?:password|publickey|keyboard-interactive/pam|'
+                         r'gssapi-with-mic|hostbased) for root from (\S+) port \d+ ssh2', journal, re.M):
         try:
             ip = ipaddress.ip_address(m.group(1))
         except ValueError:
@@ -754,11 +775,7 @@ def watch():
             continue
         if MINER.search(comm) or MINER.search(os.path.basename(exe)) or exe.startswith(('/dev/shm/', '/run/shm/')):  # nosec B108
             q = os.path.join(qdir, f'{pid}-{os.path.basename(exe).replace(" (deleted)", "")}')
-            try:
-                shutil.copy(f'{PROC}/{pid}/exe', q)
-                os.chmod(q, 0)
-            except OSError:
-                pass                                          # gone already; killed below anyway
+            q = quarantine_copy(f'{PROC}/{pid}/exe', q)
             sh(f'kill -9 {pid}')
             critical.append(f'Suspicious process killed: pid {pid} {comm} ({exe})\n  command: {cmd}\n  copy kept: {q}')
         elif re.match(r'^/(tmp|var/tmp)/', exe):
@@ -785,7 +802,10 @@ def watch():
     findings = s.setdefault('findings', [])
     findings.extend({'at': now(), 'text': t.splitlines()[0]} for t in critical + alerts)
     s['findings'] = findings[-100:]
-    save(s)
+    try:
+        save(s)
+    except OSError as e:                              # a full disk must not silence an intrusion alert
+        alerts.append(f'host-guard could not save its state: {e}')
     if critical:
         action = lockdown('; '.join(c.splitlines()[0] for c in critical))
         mail('Intrusion signs on the server', '\n\n'.join(critical + alerts) + '\n\n' + action, level='critical',
@@ -794,6 +814,33 @@ def watch():
         key = 'host-' + hashlib.sha1(''.join(alerts).encode(), usedforsecurity=False).hexdigest()[:10]
         mail(watch_subject(alerts), '\n\n'.join(alerts), key=key, level='alert', category='Host change')
     print(f'watch: {len(critical)} critical, {len(alerts)} alert(s)')
+
+
+QUARANTINE_MAX = 64 * 1024 * 1024
+
+
+def quarantine_copy(src, dst, limit=QUARANTINE_MAX):
+    """Keep at most limit bytes of a suspicious program (a huge or sparse file must not fill
+    the disk). Returns where it was kept, or why not."""
+    try:
+        with open(src, 'rb') as a, open(os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0),
+                                                0o600), 'wb') as b:
+            left = limit
+            while left > 0:
+                chunk = a.read(min(1 << 20, left))
+                if not chunk:
+                    break
+                b.write(chunk)
+                left -= len(chunk)
+            cut = left == 0 and a.read(1)
+        os.chmod(dst, 0)
+        return dst + (f' (first {limit // (1024 * 1024)} MiB only)' if cut else '')
+    except OSError as e:
+        try:
+            os.remove(dst)
+        except OSError:
+            pass
+        return f'not kept: {e.strerror or e}'
 
 
 def unlock():
@@ -811,10 +858,15 @@ def get_json(url, data=None, timeout=60):
                                           'Accept-Encoding': 'gzip',
                                           **({'Content-Type': 'application/json'} if data is not None else {})})
     with urllib.request.urlopen(req, timeout=timeout) as r:  # nosec B310
-        body = r.read()
+        body = r.read(FEED_MAX + 1)
     if body[:2] == b'\x1f\x8b':                 # AWS's price files come gzip-compressed, asked for or not
-        body = gzip.decompress(body)
-    return json.loads(body.decode('utf-8'))
+        body = gzip.GzipFile(fileobj=io.BytesIO(body)).read(FEED_MAX + 1)
+    if len(body) > FEED_MAX:
+        raise ValueError(f'answer larger than {FEED_MAX // (1024 * 1024)} MiB')
+    return json.loads(body.decode('utf-8', 'replace'))
+
+
+FEED_MAX = 200 * 1024 * 1024           # the CISA list is about 1.5 MB, AWS's biggest price file about 30 MB
 
 
 def installed_packages():
@@ -867,7 +919,11 @@ def feeds():
     except Exception as e:
         news.append(f'(Ubuntu notices not reachable: {str(e)[:80]})')
     for svc in C['CONTAINERS_PYTHON'].split():
-        pkgs = python_packages(svc)
+        try:
+            pkgs = python_packages(svc)
+        except Exception as e:
+            news.append(f'(Python packages of {svc} not readable: {str(e)[:80]})')
+            continue
         if not pkgs:
             continue
         try:
@@ -892,21 +948,23 @@ def feeds():
                         f"\n  {det.get('summary', '')[:200]}\n  fixed in: {', '.join(fixed) or 'no fix released yet'}"
                         f"\n  Ship it through a release (Dependabot, CI); the server never patches the app by itself.")
                 (news if first else urgent).append(line)
-    s['seen'] = sorted(seen)
     s['feeds'] = {'at': now(), 'urgent': len(urgent), 'news': len([n for n in news if not n.startswith('(')])}
     hist = s.setdefault('feed_items', [])
     hist.extend({'at': now(), 'text': t.splitlines()[0]} for t in urgent + news if not t.startswith('('))
     s['feed_items'] = hist[-200:]
-    save(s)
+    sent = True
     if first:
         mail(category='Advisory', subject='Early warning switched on',
              body=f'Baseline recorded: {len(seen)} known advisories. From now on only new '
              'ones that touch this server are mailed.\n\n' + '\n\n'.join(news[:30]))
     elif urgent:
-        mail(f'{len(urgent)} security warning(s) for this server', '\n\n'.join(urgent + news), level='critical',
-             category='Advisory')
+        sent = mail(f'{len(urgent)} security warning(s) for this server', '\n\n'.join(urgent + news), level='critical',
+                    category='Advisory')
     elif [n for n in news if not n.startswith('(')]:
         mail(f'{len(news)} new security notice(s)', '\n\n'.join(news), category='Advisory')
+    if sent:                                  # an urgent warning that did not go out is tried again next run
+        s['seen'] = sorted(seen)
+    save(s)
     down = [n for n in news if n.startswith('(')]
     print(f'feeds: {len(urgent)} urgent, {len(news) - len(down)} notices, {len(seen)} known'
           + (f'; {len(down)} source(s) not reachable: ' + ' '.join(down) if down else ''))
@@ -1146,6 +1204,17 @@ def backup():
     print(f'backup: {name}, {os.path.getsize(target)} bytes, off-site={kind if uploaded else "no"}')
 
 
+MARIADB_AS_ROOT = 'MYSQL_PWD="$MARIADB_ROOT_PASSWORD" mariadb -uroot'    # the password stays off every command line
+
+
+def db_env(name, value):
+    """A root-only env file for the throwaway database (a password on a command line is readable in /proc)."""
+    f = path('restore-test.env')
+    with open(os.open(f, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0), 0o600), 'w') as fh:
+        fh.write(f'{name}={value}\n')
+    return shlex.quote(f)
+
+
 def restore_test():
     """The newest backup, from S3 when configured (else local), decrypted and loaded into
     a throwaway MariaDB or PostgreSQL container (table counts reported). Output of
@@ -1171,7 +1240,7 @@ def restore_test():
     ok_sum = hashlib.sha256(open(enc, 'rb').read()).hexdigest() == s['backup']['sha256']
     rc, text = sh('bash -o pipefail -c ' + shlex.quote(f'gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 '
                                                        f'-d {enc} | gunzip > {work}/dump.sql'),
-                  900, input=C['BACKUP_PASSPHRASE'] + '\n')
+                  900, input=C['BACKUP_PASSPHRASE'] + '\n') if ok_sum else (1, 'checksum differs: not opened')
     lines = []
     docker = shutil.which('docker') is not None
     how = 'decrypted and unpacked'
@@ -1183,7 +1252,8 @@ def restore_test():
         pw = base64.b16encode(os.urandom(12)).decode()
         cname = 'host-guard-restore-test'
         sh(f'docker rm -f {cname}', 30)
-        sh(f'docker run -d --name {cname} -e POSTGRES_PASSWORD={pw} -v {work}:/restore:ro {C["PG_IMAGE"]}', 300)
+        sh(f'docker run -d --name {cname} --network none --env-file {db_env("POSTGRES_PASSWORD", pw)} '
+           f'-v {work}:/restore:ro {C["PG_IMAGE"]}', 300)
         for _ in range(60):
             if sh(f'docker exec {cname} pg_isready -U postgres', 20)[0] == 0:
                 break
@@ -1201,17 +1271,18 @@ def restore_test():
         pw = base64.b16encode(os.urandom(12)).decode()
         cname = 'host-guard-restore-test'
         sh(f'docker rm -f {cname}', 30)
-        sh(f'docker run -d --name {cname} -e MARIADB_ROOT_PASSWORD={pw} -v {work}:/restore:ro {C["MARIADB_IMAGE"]}', 300)
+        sh(f'docker run -d --name {cname} --network none --env-file {db_env("MARIADB_ROOT_PASSWORD", pw)} '
+           f'-v {work}:/restore:ro {C["MARIADB_IMAGE"]}', 300)
         for _ in range(60):
             if sh(f'docker exec {cname} healthcheck.sh --connect', 20)[0] == 0:
                 break
             time.sleep(2)
-        rc, text = sh(f"docker exec {cname} sh -c 'mariadb -uroot -p{pw} < /restore/dump.sql'", 1800)
+        rc, text = sh(f'docker exec {cname} sh -c ' + shlex.quote(MARIADB_AS_ROOT + ' < /restore/dump.sql'), 1800)
         if rc == 0:
             q = ("SELECT concat(table_schema, '.', table_name), table_rows FROM information_schema.tables WHERE "
                  "table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys') "
                  "ORDER BY table_rows DESC LIMIT 12")
-            rc2, rows = sh(f"docker exec {cname} mariadb -uroot -p{pw} -N -e \"{q}\"", 120)
+            rc2, rows = sh(f'docker exec {cname} sh -c ' + shlex.quote(MARIADB_AS_ROOT + ' -N -e ' + shlex.quote(q)), 120)
             lines = rows.splitlines()
         sh(f'docker rm -f {cname}', 60)
     shutil.rmtree(work, ignore_errors=True)

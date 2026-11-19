@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.3.0] - 2026-11-18
+## [0.3.0] - 2026-11-19
 
 ### Added
 - **Version manager** (`host-guard`): `install`, `upgrade`, `rollback [--to VERSION]`,
@@ -57,6 +57,28 @@
   included), CodeQL, and a security audit report for that version with no open confirmed
   finding ([docs/RELEASING.md](docs/RELEASING.md)). CodeQL, secret scanning with push
   protection, Dependabot alerts and private vulnerability reporting are on.
+
+### Security
+Found by the security audit of this release ([docs/audits/0.3.0.md](docs/audits/0.3.0.md)), all fixed
+with a test each:
+- A huge or sparse program named like a miner is kept in quarantine only up to 64 MiB (a copy
+  without limit could fill the disk and silence every later alert); the copy never follows a link.
+- A full disk no longer stops an intrusion mail or the lockdown.
+- A held mail no longer starts its problem's cooldown (a real alert could wait 6 hours).
+- Odd text never stops a run: invalid UTF-8 from a container, a lone surrogate in a feed, a
+  certificate date or replication lag that does not parse. A health check that crashes is
+  reported as its own problem while the others still run.
+- An urgent advisory is marked as seen only after its mail went out.
+- Feed answers are limited to 200 MiB, also after decompression; mails to 200 KB.
+- A root SSH login is read only from sshd's own line: a crafted user name cannot fake one.
+- The restore test's throwaway database gets its password from a root-only file, never a
+  command line, and runs without a network; a backup is opened only after its checksum matches.
+- Panel: a negative, signed or oversized Content-Length is refused before any body is read; a
+  stalled client is dropped after 20 s; the service is capped at 256 MB and 64 tasks; the shared
+  address block slows guessing but never refuses the right name, password and code; the audit
+  listing prints no terminal control characters and keeps 180 days.
+- The installer never follows a symbolic link planted in the web log folder.
+- A release tag publishes only when it is on main.
 
 ### Fixed
 - **A root login check mailed a false critical alert** (found by the red team): with

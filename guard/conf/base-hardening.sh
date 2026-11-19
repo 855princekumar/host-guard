@@ -105,7 +105,14 @@ banaction = iptables-allports
 EOF
 if [ -n "$WEB_LOGS" ]; then
   mkdir -p "$WEB_LOGS"
-  touch "$WEB_LOGS/access.log" "$WEB_LOGS/error.log"
+  for f in access.log error.log; do
+    # a compromised web container could link these to a system file; never follow a link here
+    if [ -L "$WEB_LOGS/$f" ]; then
+      echo "host-guard: $WEB_LOGS/$f is a symbolic link; refusing to use it" >&2
+      exit 1
+    fi
+    [ -e "$WEB_LOGS/$f" ] || ( set -C; : > "$WEB_LOGS/$f" )
+  done
   cat > /etc/fail2ban/filter.d/web-probe.conf <<'EOF'
 # Requests for files that a normal visitor never asks for.
 [Definition]
