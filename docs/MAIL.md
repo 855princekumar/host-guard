@@ -29,7 +29,8 @@ severity, then by kind, then by server, and a filter can route each kind:
 ## Categories
 
 `Intrusion`, `Attack`, `Host change`, `Advisory`, `Backup`, `Health`, `Updates`,
-`Scan`, `Daily report`, `Test`.
+`Scan`, `Daily report`, `Test`, `Sign-in` (a dashboard sign-in code, to that admin only, and
+the notice of every dashboard sign-in, to all admins).
 
 ## Headers for filters
 
@@ -59,7 +60,8 @@ Outlook and other clients can filter on the subject prefix the same way.
   (flood protection)", and the daily report counts them. An attack that trips a ban every
   few minutes gives a handful of mails an hour, not hundreds.
 * Never held: P1 mails, resolved mails, the daily report, and every `Intrusion` and
-  `Host change` mail. Those are signs of someone on the server; holding them would let an
+  `Host change` mail (and every `Sign-in` mail: a held code is useless, and the mailer limits
+  codes on its own, 5 per address in 15 minutes). The first two are signs of someone on the server; holding them would let an
   intruder bury the alert that matters under a few noisy ones (the red team tried: HOST-9).
   Flood protection applies to what outsiders can trigger at volume (bans, health, backups,
   notices).

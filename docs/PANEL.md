@@ -1,8 +1,13 @@
 # The panel
 
 One page with everything host-guard knows (health, intrusion watch, bans, backup,
-restore test, scan, early warning, open problems, recent mails), for one admin.
+restore test, scan, early warning, open problems, recent mails), for the admins.
 Read-only in this version: changes are made on the server.
+
+**No password.** An admin types their email address, gets a 6-digit code at that address,
+and signs in with it. The admins are the addresses host-guard already mails (`--mail-to` at
+install, `MAIL_TO` in `/etc/host-guard/guard.conf`), or `PANEL_ADMINS` there when only some
+of them should see the dashboard.
 
 Python 3 standard library and one SQLite file. No framework, no JavaScript.
 
@@ -11,16 +16,27 @@ Python 3 standard library and one SQLite file. No framework, no JavaScript.
 host-guard must be installed first.
 
 ```bash
-sudo host-guard install ... --with-panel        # with host-guard; or later: sudo host-guard upgrade --with-panel
-sudo -u hgpanel python3 /usr/local/lib/host-guard-panel/hgpanel.py init-admin yourname
+sudo host-guard install --mail-to you@example.com,ops@example.com ... --with-panel
+# or later: sudo host-guard upgrade --with-panel
 ```
 
-(Without the version manager: `sudo bash panel/install.sh`.)
+(Without the version manager: `sudo bash panel/install.sh`.) Nothing else to set up: the
+admins are the `--mail-to` addresses. To let only some of them in, add
+`PANEL_ADMINS=you@example.com` to `/etc/host-guard/guard.conf`.
 
-`init-admin` asks for a password twice (12 characters at least, not shown) and
-prints an authenticator key once, in your terminal only. Add it to any TOTP app
-(Google Authenticator, 1Password, Aegis, ...) and type the code it shows to
-confirm. `--reset` replaces the admin and signs everyone out.
+## Sign in
+
+1. Open the dashboard (below) and type your address: **Send me a sign-in code**.
+2. A mail *Your dashboard sign-in code* arrives at that address only, with a 6-digit code.
+3. Type the code. It works once, for 10 minutes.
+
+Every sign-in is mailed to all admins (*Dashboard sign-in: you@example.com*), so a sign-in
+nobody expected is seen at once.
+
+<p align="center">
+<img src="assets/panel-signin.png" alt="Step 1: the admin's email address" width="49%">
+<img src="assets/panel-signin-code.png" alt="Step 2: the 6-digit code from the mail" width="49%">
+</p>
 
 ## Open it
 
@@ -39,12 +55,11 @@ port has to be opened. You bring it to your own computer through a tunnel, then 
 
 Every route ends in the same place: your browser talks to `127.0.0.1:8650` on your own
 computer, which the tunnel carries to `127.0.0.1:8650` on the server. Whoever cannot open
-the tunnel cannot even see the sign-in page; whoever can still needs the password and the
-authenticator code.
+the tunnel cannot even see the sign-in page; whoever can still needs a code from an admin's
+mailbox.
 
 <p align="center">
-<img src="assets/panel-signin.png" alt="The panel's sign-in page: name, password and authenticator code" width="49%">
-<img src="assets/panel-dashboard.png" alt="The panel's dashboard: open problems, health, intrusion watch, bans, backup, restore test, scan, early warning and recent mails" width="49%">
+<img src="assets/panel-dashboard.png" alt="The panel's dashboard: open problems, health, intrusion watch, bans, backup, restore test, scan, early warning and recent mails" width="70%">
 </p>
 <p align="center"><img src="assets/panel-dashboard-dark.png" alt="The dashboard in dark mode" width="70%"></p>
 
@@ -58,31 +73,43 @@ signed in through the panel's own form), with the red team's attack traffic in t
 | Exposure | 127.0.0.1 by default; any other address is refused unless set on purpose; the `Host` header must match (no DNS rebinding) |
 | Privilege | runs as `hgpanel`: no shell, no home, no capabilities, read-only system, private /tmp, system-call filter (`systemd-analyze security` exposure about 1.3) |
 | Secrets | cannot read `/etc/host-guard`, `/var/lib/host-guard` or the backups (also blocked in the unit); root's `hostguard export` writes a status file without secrets into a folder the panel can read but not write |
-| Admins | the table holds one row; password hashed with scrypt (N=2^15) |
-| Second factor | TOTP (RFC 6238), 30 s steps, a code works once (replay refused) |
-| Guessing | 5 failures lock the account for 15 minutes; 10 failures from one address in 15 minutes block further guesses from it (every visitor arrives through the tunnel as 127.0.0.1, so the right name, password and code still get in: nobody can lock the admin out this way); the message never says which part was wrong |
+| Who may sign in | only the admin addresses (`PANEL_ADMINS`, else `MAIL_TO`), decided by root, not by the panel: the panel never learns the list, so it answers every address the same way and nobody can find out which addresses are admins |
+| Codes | 6 random digits; only a salted SHA-256 is stored; single use; 10 minutes; 5 wrong tries burn the code; 3 requests per address in 10 minutes |
+| Mailing | the panel cannot read the mail password: it leaves the request in its outbox (`/var/lib/host-guard-panel/outbox`, its own, 0700) and the root service `host-guard-panel-mail.path` runs `hostguard panel-outbox`, which mails a code only to that admin, at most 5 per address in 15 minutes and 30 an hour, follows no link, reads only small files of the panel's user and removes every entry; so even a panel that was taken over cannot mail anyone but the admins, or mail them much |
+| Guessing | 10 failures in 15 minutes block further guesses (every visitor arrives through the tunnel as 127.0.0.1, so the right code still gets in: nobody can lock the admins out this way) |
+| Notice | every sign-in is mailed to all admins |
 | Sessions | 256-bit random token, only its SHA-256 stored; cookie HttpOnly, SameSite=Strict, Secure; 15 minutes idle, 8 hours at most; a new token at every sign-in |
 | Web | a CSRF token on every form; parameterized SQL only; every value HTML-escaped; Content-Security-Policy `default-src 'none'` (no script at all); no framing; `no-store`; 8 KB request limit |
 | Cross-site | a form post whose `Origin` is another site, or that the browser marks `Sec-Fetch-Site: cross-site`, is refused and audited; no CORS header is ever sent |
-| Audit | sign-ins, failures, lockouts, blocked addresses, cross-site posts and sign-outs, at `/audit` or `hgpanel audit` |
-| Tested | every change: unit tests, plus the red team in CI with raw HTTP and a real browser (sign-in, session fixation, stored script injection, CORS reads, cross-site posts, framing, unusual methods, path traversal, guessing, code replay); see [REDTEAM.md](REDTEAM.md) |
+| Audit | code requests (with the address), sign-ins, failures, burned codes, blocked guesses, cross-site posts and sign-outs, at `/audit` or `hgpanel audit` |
+| Tested | every change: unit tests, plus the red team in CI with raw HTTP and a real browser (sign-in with the code read from the mailbox, address enumeration, code flooding, a taken-over panel feeding the root mailer, session fixation, stored script injection, CORS reads, cross-site posts, framing, unusual methods, path traversal, guessing, code replay); see [REDTEAM.md](REDTEAM.md) |
 
 ```mermaid
 sequenceDiagram
     participant B as your browser (through ssh -L)
     participant P as hgpanel (127.0.0.1)
     participant D as panel.db
+    participant O as outbox (the panel's, 0700)
+    participant R as hostguard panel-outbox (root)
+    participant M as the admin's mailbox
     B->>P: GET / (no session)
-    P-->>B: sign-in form + one-time form token cookie
-    B->>P: POST /login name, password, code, form token
-    P->>D: admin row (parameterized)
-    P->>P: scrypt check, TOTP check (step newer than the last used)
-    alt all right
-        P->>D: new session (token hash), audit "sign-in"
+    P-->>B: address form + one-time form token cookie
+    B->>P: POST /login address, form token
+    P->>D: salted hash of a new 6-digit code, audit "code requested"
+    P->>O: {"kind": "code", address, code}
+    P-->>B: the same answer for every address, code form
+    O-->>R: host-guard-panel-mail.path starts it
+    R->>R: address in PANEL_ADMINS or MAIL_TO? under the limits?
+    R->>M: "Your dashboard sign-in code" (to that address only)
+    B->>P: POST /login/code address, code, form token
+    alt the right code, in time, under 5 tries
+        P->>D: code deleted (single use), new session (token hash), audit "sign-in"
+        P->>O: {"kind": "signed-in", address}
+        O-->>R: every admin is mailed "Dashboard sign-in"
         P-->>B: 303 to /, session cookie (HttpOnly, Strict)
-    else anything wrong
-        P->>D: failure counted, audit
-        P-->>B: 401 "Sign-in failed. Check the name, password and code."
+    else anything else
+        P->>D: try counted (5 burn the code), audit
+        P-->>B: 401 "That code is not valid. Ask for a new one."
     end
 ```
 
@@ -98,8 +125,12 @@ sequenceDiagram
 | `ALLOWED_HOSTS` | empty | extra accepted `Host` headers, comma separated |
 | `COOKIE_SECURE` | `1` | browsers accept Secure cookies on 127.0.0.1 and localhost |
 | `IDLE_MIN`, `MAX_HOURS` | `15`, `8` | session limits |
-| `LOCK_AFTER`, `LOCK_MIN`, `IP_LIMIT` | `5`, `15`, `10` | lockout and per-address limits |
-| `DB`, `STATUS_FILE` | `/var/lib/host-guard-panel/panel.db`, `/var/lib/host-guard-export/status.json` | files |
+| `CODE_MIN`, `CODE_TRIES`, `CODE_REQUESTS` | `10`, `5`, `3` | a code's life in minutes, wrong tries before it is burned, requests per address in 10 minutes |
+| `LOCK_MIN`, `IP_LIMIT` | `15`, `10` | failures in that many minutes that block further guesses |
+| `DB`, `STATUS_FILE`, `OUTBOX` | `/var/lib/host-guard-panel/panel.db`, `/var/lib/host-guard-export/status.json`, `/var/lib/host-guard-panel/outbox` | files |
+
+Who the admins are is a host-guard setting, not a panel one: `PANEL_ADMINS` in
+`/etc/host-guard/guard.conf` (empty: every `MAIL_TO` address).
 
 ## Roadmap
 

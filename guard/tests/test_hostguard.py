@@ -657,3 +657,71 @@ def test_a_broken_certificate_date_or_lag_never_stops_the_health_run(hg, monkeyp
     assert hg.replication()[0] is False
     monkeypatch.setattr(hg, '_checks', lambda: 1 / 0)
     assert hg.checks()[0][:3] == ('health-check', True, 'A health check failed to run')
+
+
+# ---------------------------------------------------------------- the panel's sign-in mails
+def drop(box, name, data):
+    os.makedirs(box, exist_ok=True)
+    p = os.path.join(box, name)
+    with open(p, 'w', encoding='utf-8') as f:
+        f.write(data if isinstance(data, str) else json.dumps(data))
+    return p
+
+
+def sent_to(hg):
+    """[(recipients line, mail text)] of what the catcher got."""
+    text = hg.SENT.read_text(encoding='utf-8') if hg.SENT.exists() else ''
+    return [(m.split('\n', 1)[0], m) for m in text.split('To: ')[1:]]
+
+
+def test_a_sign_in_code_goes_only_to_that_admin_and_only_to_admins(hg, tmp_path):
+    box = str(tmp_path / 'outbox')
+    hg.C.update({'PANEL_OUTBOX': box, 'PANEL_USER': 'no-such-user', 'MAIL_TO': 'a@example.com, b@example.com'})
+    t = time.time()
+    drop(box, f'{int(t * 1000)}-{"1" * 16}.json', {'kind': 'code', 'email': 'B@example.com', 'code': '123456', 'at': t})
+    drop(box, f'{int(t * 1000) + 1}-{"2" * 16}.json', {'kind': 'code', 'email': 'evil@example.org', 'code': '654321', 'at': t})
+    drop(box, f'{int(t * 1000) + 2}-{"3" * 16}.json', {'kind': 'code', 'email': 'a@example.com', 'code': '12345x', 'at': t})
+    drop(box, f'{int(t * 1000) + 3}-{"4" * 16}.json', {'kind': 'code', 'email': 'a@example.com', 'code': '111111', 'at': t - 3600})
+    hg.panel_outbox()
+    mails = sent_to(hg)
+    assert len(mails) == 1 and mails[0][0] == 'b@example.com'
+    assert 'Code: 123456' in mails[0][1] and '[P3 Info] Sign-in | test-host | Your dashboard sign-in code' in mails[0][1]
+    assert '654321' not in hg.SENT.read_text() and os.listdir(box) == []
+    log = json.load(open(os.path.join(hg.C['STATE_DIR'], 'mail-log.json')))
+    assert not any('123456' in m['subject'] for m in log['sent'])          # the code is never in a subject or a log
+
+
+def test_the_outbox_follows_no_link_and_removes_everything(hg, tmp_path):
+    box = str(tmp_path / 'outbox')
+    secret = tmp_path / 'shadow'
+    secret.write_text('root:$6$hash')
+    hg.C.update({'PANEL_OUTBOX': box, 'PANEL_USER': 'no-such-user', 'MAIL_TO': 'a@example.com'})
+    t = int(time.time() * 1000)
+    os.makedirs(box)
+    if os.name != 'nt':
+        os.symlink(secret, os.path.join(box, f'{t}-{"a" * 16}.json'))
+    drop(box, f'{t + 1}-{"b" * 16}.json', 'x' * 5000)
+    drop(box, 'notes.txt', 'hello')
+    os.makedirs(os.path.join(box, 'junk-dir'))
+    hg.panel_outbox()
+    assert os.listdir(box) == [] and not sent_to(hg) and secret.read_text() == 'root:$6$hash'
+
+
+def test_codes_are_limited_even_if_the_panel_floods_the_outbox(hg, tmp_path):
+    box = str(tmp_path / 'outbox')
+    hg.C.update({'PANEL_OUTBOX': box, 'PANEL_USER': 'no-such-user', 'MAIL_TO': 'a@example.com', 'MAIL_MAX_PER_HOUR': '1'})
+    t = time.time()
+    for i in range(8):
+        drop(box, f'{int(t * 1000) + i}-{str(i) * 16}.json', {'kind': 'code', 'email': 'a@example.com', 'code': f'{i}' * 6, 'at': t})
+    hg.panel_outbox()
+    assert len(sent_to(hg)) == 5                     # 5 per address in 15 minutes; flood protection never holds them
+
+
+def test_a_sign_in_is_announced_to_every_admin(hg, tmp_path):
+    box = str(tmp_path / 'outbox')
+    hg.C.update({'PANEL_OUTBOX': box, 'PANEL_USER': 'no-such-user', 'MAIL_TO': 'a@example.com b@example.com'})
+    drop(box, f'{int(time.time() * 1000)}-{"c" * 16}.json', {'kind': 'signed-in', 'email': 'b@example.com', 'at': time.time()})
+    hg.panel_outbox()
+    mails = sent_to(hg)
+    assert len(mails) == 1 and mails[0][0] == 'a@example.com, b@example.com'
+    assert 'Dashboard sign-in: b@example.com' in mails[0][1]

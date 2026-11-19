@@ -1,0 +1,6 @@
+[Unit]
+Description=host-guard: mail the panel's sign-in codes (to admin addresses only) and sign-in notices
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/hostguard panel-outbox

@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.4.0] - 2026-11-19
+
+### Changed
+- **Dashboard sign-in by email, no password.** An admin types their email address and signs
+  in with the 6-digit code mailed to it: single use, 10 minutes, 5 wrong tries burn it, 3
+  requests per address in 10 minutes. The admins are the `--mail-to` addresses (`MAIL_TO`), or
+  `PANEL_ADMINS` when only some of them should see the dashboard. The panel answers every
+  address the same way (it never learns who the admins are), and every sign-in is mailed to
+  all admins. The password, the authenticator and `hgpanel init-admin` are gone; the old
+  admin row is dropped from the panel's database on first start.
+- The panel still cannot read the mail password: it leaves the request in its own outbox and
+  a root service (`host-guard-panel-mail.path` running `hostguard panel-outbox`) mails it,
+  only to an admin address, at most 5 per address in 15 minutes and 30 an hour, following no
+  link and removing every entry, so a panel that was taken over cannot mail anyone else.
+- New mail category `Sign-in` (never held by flood protection).
+
+### Added
+- Red team: sign-in with the code read from the captured mailbox (browser and raw HTTP),
+  address enumeration (PANEL-18), code flooding (PANEL-19), a taken-over panel feeding the
+  root mailer a code for an outsider, a link to `/etc/shadow`, a huge file and a folder
+  (PANEL-20), the sign-in notice (PANEL-21); code guessing and replay rewritten for codes.
+
 ## [0.3.1] - 2026-11-19
 
 ### Added

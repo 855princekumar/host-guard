@@ -1,0 +1,8 @@
+[Unit]
+Description=host-guard: the panel left a sign-in code or notice to mail
+
+[Path]
+DirectoryNotEmpty=/var/lib/host-guard-panel/outbox
+
+[Install]
+WantedBy=paths.target

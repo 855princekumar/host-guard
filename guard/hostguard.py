@@ -89,6 +89,9 @@ DEFAULTS = {
     'USN_URL': 'https://ubuntu.com/security/notices.json?limit=30',
     'OSV_URL': 'https://api.osv.dev/v1/querybatch', 'OSV_VULN_URL': 'https://api.osv.dev/v1/vulns/',
     'CONTAINERS_PYTHON': '',
+    # the panel's sign-in: who may get a code (empty: every MAIL_TO address), where the panel
+    # leaves its requests, and the panel's own user (only its files are read)
+    'PANEL_ADMINS': '', 'PANEL_OUTBOX': '/var/lib/host-guard-panel/outbox', 'PANEL_USER': 'hgpanel',
     # running cost: AWS's public price files (no credentials); the PRICE_* values are used
     # when they cannot be read. Mumbai list prices of 2026-11-10.
     'PRICES_URL': 'https://b0.p.awsstatic.com/pricing/2.0/meteredUnitMaps',
@@ -329,10 +332,10 @@ def mail_html(subject, body, level, footer):
 SEVERITY = {'critical': ('P1', 'Critical'), 'alert': ('P2', 'Attention'), 'info': ('P3', 'Info'),
             'resolved': ('', 'Resolved'), 'daily': ('', 'Daily')}
 CATEGORIES = ('Intrusion', 'Attack', 'Host change', 'Advisory', 'Backup', 'Health', 'Updates', 'Scan', 'Daily report',
-              'Test')
+              'Test', 'Sign-in')
 # Never held by flood protection: signs of someone on the server. Holding them would let an
 # intruder bury the alert that matters under a few noisy ones (red-team HOST-9).
-NEVER_HELD = ('Intrusion', 'Host change', 'Daily report', 'Test')
+NEVER_HELD = ('Intrusion', 'Host change', 'Daily report', 'Test', 'Sign-in')   # a held sign-in code is useless
 KEY_CATEGORY = {'memory': 'Health', 'disk': 'Health', 'containers': 'Health', 'https': 'Health', 'cert': 'Health',
                 'replication': 'Health', 'backup': 'Backup', 'backup-upload': 'Backup', 'backup-failed': 'Backup',
                 'reboot': 'Updates'}
@@ -353,7 +356,7 @@ def _held(log, category):
 MAIL_BODY_MAX = 200_000
 
 
-def mail(subject, body, key=None, level='info', category=None):
+def mail(subject, body, key=None, level='info', category=None, to=None):
     """Send one mail. With a key, the same problem mails at most once per COOLDOWN_H
     hours; resolved() clears it. P2 and P3 mails of one category are limited to
     MAIL_MAX_PER_HOUR an hour: the rest are held, named in the next mail of that category
@@ -389,7 +392,7 @@ def mail(subject, body, key=None, level='info', category=None):
                  + '\n'.join(f'  {stamp(h["at"])[11:16]}  {h["subject"]}' for h in held[-20:]))
         log['held'] = [h for h in log.get('held', []) if h not in held]
     full = mail_subject(subject, level, category)
-    rcpts = recipients()
+    rcpts = recipients() if to is None else [a for a in to if EMAIL.match(a)]     # to: one admin only (a sign-in code)
     to = ', '.join(rcpts)
     frm = C['MAIL_FROM'] or (rcpts[0] if rcpts else '')
     footer = f'host-guard on {C["SITE"]}{" | " + C["SITE_URL"] if C["SITE_URL"] else ""} | {stamp()}'
@@ -1914,6 +1917,103 @@ def export():
     print(f'exported to {target}')
 
 
+# ---------------------------------------------------------------- the panel's sign-in mails (root)
+OUTBOX_NAME = re.compile(r'^\d{10,16}-[0-9a-f]{16}\.json$')
+
+
+def panel_admins():
+    raw = C['PANEL_ADMINS'] or C['MAIL_TO']
+    return {a.lower() for a in re.split(r'[,\s]+', raw.strip()) if a and EMAIL.match(a)}
+
+
+def panel_outbox():
+    """Mail what the panel left in its outbox: a sign-in code (only to that address, and only
+    if it is an admin) or a sign-in notice (to every admin). The panel runs unprivileged and
+    cannot read the mail password; this runs as root (host-guard-panel-mail.path) and trusts
+    nothing in the folder: no link is followed, only small regular files of the panel's own
+    user are read, every entry is removed, and codes are limited to 5 per address in
+    15 minutes and 30 an hour in all, even if the panel itself were taken over."""
+    import pwd
+    import stat as st_
+    d = C['PANEL_OUTBOX']
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        print('panel-outbox: nothing to do')
+        return
+    try:
+        uid = pwd.getpwnam(C['PANEL_USER']).pw_uid
+    except (KeyError, ImportError):
+        uid = None
+    admins = panel_admins()
+    s = load('panel-mail.json')
+    sent = [x for x in s.get('sent', []) if x.get('at', 0) > now() - 3600]
+    done = refused = 0
+    for n in names:
+        p = os.path.join(d, n)
+        data = None
+        if OUTBOX_NAME.match(n):
+            fd = None
+            try:
+                fd = os.open(p, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+                info = os.fstat(fd)
+                if st_.S_ISREG(info.st_mode) and info.st_size <= 2048 and (uid is None or info.st_uid == uid):
+                    data = json.loads(os.read(fd, 2049).decode('utf-8'))
+            except (OSError, ValueError):
+                data = None
+            finally:
+                if fd is not None:
+                    os.close(fd)
+        elif n.endswith('.tmp'):
+            try:
+                if now() - os.lstat(p).st_mtime < 60:
+                    continue                                 # being written right now
+            except OSError:
+                continue
+        try:                                                 # every entry goes, used or not (no endless trigger)
+            if os.path.isdir(p) and not os.path.islink(p):
+                shutil.rmtree(p)
+            else:
+                os.unlink(p)
+        except OSError:
+            pass
+        if not isinstance(data, dict):
+            refused += 1
+            continue
+        email, kind = str(data.get('email', '')).strip().lower(), data.get('kind')
+        try:
+            fresh = now() - float(data.get('at', 0)) < 600
+        except (TypeError, ValueError):
+            fresh = False
+        if email not in admins or not fresh:
+            refused += 1                                     # not an admin: nothing is sent, the panel cannot tell
+            continue
+        if kind == 'code' and re.fullmatch(r'\d{6}', str(data.get('code', ''))):
+            mine = [x for x in sent if x['email'] == email and x['at'] > now() - 900]
+            if len(mine) >= 5 or len(sent) >= 30:
+                refused += 1
+                print(f'panel-outbox: code for {email} not sent (limit reached)')
+                continue
+            mail(subject='Your dashboard sign-in code', category='Sign-in', level='info', to=[email], body=
+                 f'Code: {data["code"]}\n\nIt works once, for 10 minutes, on the host-guard dashboard of {C["SITE"]}.\n\n'
+                 'Did you not ask for it? Someone who can reach the dashboard (it is only reachable through a '
+                 'tunnel to this server) entered your address. Nothing happens without the code. Tell the other '
+                 'admins, and look at the audit log: sudo -u hgpanel python3 /usr/local/lib/host-guard-panel/hgpanel.py audit')
+            sent.append({'at': now(), 'email': email})
+            done += 1
+        elif kind == 'signed-in':
+            mail(subject=f'Dashboard sign-in: {email}', category='Sign-in', level='info', body=
+                 f'{email} signed in to the host-guard dashboard of {C["SITE"]} at {stamp()}.\n\n'
+                 'Not expected? The session ends after 15 minutes idle or 8 hours. Look at the audit log: '
+                 'sudo -u hgpanel python3 /usr/local/lib/host-guard-panel/hgpanel.py audit')
+            done += 1
+        else:
+            refused += 1
+    s['sent'] = sent
+    save(s, 'panel-mail.json')
+    print(f'panel-outbox: {done} mailed, {refused} refused')
+
+
 def test_mail():
     ok = mail('Test mail', 'If you can read this, host-guard can reach you.', category='Test')
     print('sent' if ok else 'NOT sent: check /etc/msmtprc and the MAIL_TO setting')
@@ -1922,7 +2022,8 @@ def test_mail():
 
 COMMANDS = {'health': health, 'cost': cost, 'watch': watch, 'feeds': feeds, 'scan': scan, 'backup': backup,
             'restore-test': restore_test, 'patch-window': patch_window, 'boot': boot, 'report': report,
-            'status': status, 'test-mail': test_mail, 'unlock': unlock, 'export': export, 'whereami': whereami}
+            'status': status, 'test-mail': test_mail, 'unlock': unlock, 'export': export, 'whereami': whereami,
+            'panel-outbox': lambda: panel_outbox()}
 
 if __name__ == '__main__':
     if len(sys.argv) == 2 and sys.argv[1] in COMMANDS or sys.argv[1:] == ['whereami', '--short']:

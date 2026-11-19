@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
 """Attacks on the panel from someone who can reach 127.0.0.1:8650 (an SSH tunnel) but should
-not get in, and from someone holding a stolen session cookie. Prints one JSON object per check:
-{"id", "technique", "attack", "expected", "result": PASS|FAIL|GAP, "evidence"}."""
-import base64
-import hashlib
-import hmac
+not get in, from someone holding a stolen session cookie, and from the panel's own user if it
+were taken over (abusing the root mailer). Runs on the target as root; reads sign-in codes from
+the captured mailbox the way an admin reads them from an inbox. Prints one JSON object per
+check: {"id", "technique", "attack", "expected", "result": PASS|FAIL|GAP, "evidence"}."""
 import http.client
 import json
+import os
 import re
-import struct
+import subprocess
 import time
 import urllib.parse
 
 HOST, PORT = '127.0.0.1', 8650
-USER, PASSWORD, SECRET = 'admin', 'Panel-Pass-2026!', 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP'
-
-
-def totp(step):
-    key = base64.b32decode(SECRET)
-    mac = hmac.new(key, struct.pack('>Q', step), hashlib.sha1).digest()
-    off = mac[-1] & 0x0F
-    return str((struct.unpack('>I', mac[off:off + 4])[0] & 0x7FFFFFFF) % 10 ** 6).zfill(6)
+ADMIN = 'admin2@example.com'            # the browser stage signs in as security@example.com
+OUTSIDER = 'outsider@example.org'
+MAILBOX = '/var/mail/hg-captured'
+OUTBOX = '/var/lib/host-guard-panel/outbox'
 
 
 def req(method, path, body=None, headers=None, host=None):
@@ -45,21 +41,60 @@ def cookies_of(headers):
     return jar, raw
 
 
-def login_form():
-    st, hdr, body = req('GET', '/login')
-    jar, _ = cookies_of(hdr)
+def form_token(path='/login', jar=None):
+    st, hdr, body = req('GET', path, headers={'Cookie': '; '.join(f'{k}={v}' for k, v in (jar or {}).items())})
+    pre = cookies_of(hdr)[0].get('hg_pre', '')
     m = re.search(r'name="csrf" value="([^"]+)"', body)
-    return jar.get('hg_pre', ''), m.group(1) if m else ''
+    return pre, m.group(1) if m else ''
 
 
-def login(password=PASSWORD, code=None, user=USER, csrf_override=None):
-    pre, csrf = login_form()
-    code = code or totp(int(time.time() // 30))
-    st, hdr, body = req('POST', '/login', {'username': user, 'password': password, 'code': code,
-                                           'csrf': csrf if csrf_override is None else csrf_override},
+def mailbox():
+    try:
+        return open(MAILBOX, encoding='utf-8', errors='replace').read()
+    except OSError:
+        return ''
+
+
+def mails_to(addr, text=None):
+    """The mails in the mailbox addressed to addr (the capture writes '=== MAIL to ADDR')."""
+    parts = (text if text is not None else mailbox()).split('=== MAIL to ')
+    return [p for p in parts[1:] if p.split('\n', 1)[0].strip() == addr]
+
+
+def ask_code(email, csrf_override=None):
+    """POST the address; returns (status, page, pre cookie, form token for the code form)."""
+    pre, csrf = form_token()
+    st, hdr, body = req('POST', '/login', {'email': email, 'csrf': csrf if csrf_override is None else csrf_override},
                         {'Cookie': f'hg_pre={pre}'})
+    jar = cookies_of(hdr)[0]
+    m = re.search(r'name="csrf" value="([^"]+)"', body)
+    return st, body, jar.get('hg_pre', ''), (m.group(1) if m else '')
+
+
+def wait_code(email, before, timeout=25):
+    """The newest code mailed to email after the mailbox had `before` characters."""
+    end = time.time() + timeout
+    while time.time() < end:
+        new = mailbox()[before:]
+        codes = [m for p in mails_to(email, new) for m in re.findall(r'Code: (\d{6})', p)]
+        if codes:
+            return codes[-1]
+        time.sleep(0.5)
+    return ''
+
+
+def send_code(email, code, pre, csrf):
+    st, hdr, body = req('POST', '/login/code', {'email': email, 'code': code, 'csrf': csrf}, {'Cookie': f'hg_pre={pre}'})
     jar, raw = cookies_of(hdr)
     return st, jar.get('hg_s'), raw, body
+
+
+def sign_in(email=ADMIN):
+    before = len(mailbox())
+    st, body, pre, csrf = ask_code(email)
+    code = wait_code(email, before)
+    st2, tok, raw, body2 = send_code(email, code, pre, csrf)
+    return code, st2, tok, raw, body2
 
 
 out = []
@@ -83,25 +118,44 @@ check('PANEL-2', 'T1185', 'Clickjacking, script injection, cached pages',
       'CSP without script, no framing, nosniff, no-store', not missing,
       'all present' if not missing else 'missing: ' + ', '.join(missing))
 
-st, tok, raw, body = login(csrf_override='forged')
-check('PANEL-3', 'T1185', 'Cross-site login (forged form token)', 'refused', st == 403 and not tok, f'HTTP {st}')
+before = len(mailbox())
+st, body, _, _ = ask_code(ADMIN, csrf_override='forged')
+time.sleep(3)
+check('PANEL-3', 'T1185', 'Cross-site code request (forged form token)', 'refused, no code mailed',
+      st == 403 and not mails_to(ADMIN, mailbox()[before:]), f'HTTP {st}; codes mailed: {len(mails_to(ADMIN, mailbox()[before:]))}')
 
-st, tok, raw, body = login(user="admin' OR '1'='1' --", password="x' OR '1'='1")
-check('PANEL-4', 'T1190', 'SQL injection in the sign-in form', 'generic refusal, no error, no session',
-      st == 401 and not tok and 'Traceback' not in body, f'HTTP {st}, generic message: {"Sign-in failed" in body}')
+st, body, pre, csrf = ask_code("admin' OR '1'='1' --@example.com")
+st2, tok, _, body2 = send_code(ADMIN, "1' OR '1'='1", pre, csrf)
+check('PANEL-4', 'T1190', 'SQL injection in the address and the code', 'refused as not an address / not a code; no error, no session',
+      st == 400 and st2 in (401, 403) and not tok and 'Traceback' not in body + body2, f'address: HTTP {st}; code: HTTP {st2}')
 
-st, tok, raw, body = login()
+# address enumeration: an admin's address and anyone else's get the same answer, and only the admin gets mail
+before = len(mailbox())
+sa, ba, _, _ = ask_code(ADMIN)
+so, bo, _, _ = ask_code(OUTSIDER)
+time.sleep(4)
+strip = lambda t, e: re.sub(r'value="[^"]+"', '', t).replace(e, 'X')        # noqa: E731
+same = sa == so and strip(ba, ADMIN) == strip(bo, OUTSIDER)
+to_outsider = len(mails_to(OUTSIDER, mailbox()[before:]))
+check('PANEL-18', 'T1589.002', 'Find out which addresses are admins (ask for a code for an admin and for anyone else)',
+      'the same answer for both; a code only ever goes to an admin', same and to_outsider == 0,
+      f'same page and status: {same}; mails to the outsider: {to_outsider}')
+
+code, st, tok, raw, body = sign_in()
 flags = next((r for r in raw if r.startswith('hg_s=')), '')
 good = st == 303 and tok and all(f in flags for f in ('HttpOnly', 'SameSite=Strict', 'Secure'))
 check('PANEL-5', 'T1539', 'Session cookie theft by script or cross-site request', 'HttpOnly, SameSite=Strict, Secure',
-      good, f'HTTP {st}; cookie flags: {"; ".join(p.strip() for p in flags.split(";")[1:])}')
-used_code = totp(int(time.time() // 30))
+      good, f'code from the mailbox: {bool(code)}; HTTP {st}; cookie flags: {"; ".join(p.strip() for p in flags.split(";")[1:])}')
+time.sleep(3)
+notice = [p for p in mailbox().split('=== MAIL to ')[1:] if f'Dashboard sign-in: {ADMIN}' in p]
+check('PANEL-21', 'T1078', 'A sign-in by someone who got hold of an admin\'s mailbox', 'every admin is mailed about every sign-in',
+      bool(notice), f'sign-in notices mailed: {len(notice)}')
 
 st2, hdr2, body2 = req('GET', '/', headers={'Cookie': f'hg_s={tok}', 'User-Agent': 'curl/8.5.0 (another machine)'})
 check('PANEL-6', 'T1550.004', 'Stolen session cookie replayed from another browser',
       'detected or refused (session bound to the browser, anomaly mailed)', st2 != 200,
       f'HTTP {st2}: the stolen cookie works from another client; no binding or anomaly alert yet '
-      '(planned: session binding and hijack alerts in the panel release)', gap=True)
+      '(planned: session binding and hijack alerts)', gap=True)
 
 m = re.search(r'name="csrf" value="([^"]+)"', body2)
 st3, _, _ = req('POST', '/logout', {'csrf': 'wrong'}, {'Cookie': f'hg_s={tok}'})
@@ -109,17 +163,18 @@ check('PANEL-7', 'T1185', 'Cross-site request with a valid cookie but no form to
 if m:
     req('POST', '/logout', {'csrf': m.group(1)}, {'Cookie': f'hg_s={tok}'})
 st4b, _, body4 = req('GET', '/', headers={'Cookie': f'hg_s={tok}'})
-signin = 'name="password"' in body4
+signin = 'name="email"' in body4
 check('PANEL-8', 'T1550.004', 'Reuse of a session cookie after sign-out', 'session gone (sign-in page)',
       signin, f'HTTP {st4b}, sign-in page shown: {signin}')
 
-st, tok, raw, body = login(code=used_code)
-check('PANEL-9', 'T1111', 'Replay of an authenticator code already used', 'refused', not tok, f'HTTP {st}')
+pre, csrf = form_token()
+st, tok, _, _ = send_code(ADMIN, code, pre, csrf)
+check('PANEL-9', 'T1111', 'Replay of a sign-in code already used', 'refused (single use)', not tok and st == 401, f'HTTP {st}')
 
 codes, cors = {}, []
-for m in ('PUT', 'DELETE', 'PATCH', 'TRACE', 'OPTIONS'):
-    st, hdr, _ = req(m, '/', headers={'Origin': 'https://evil.example', 'Access-Control-Request-Method': 'POST'})
-    codes[m] = st
+for m_ in ('PUT', 'DELETE', 'PATCH', 'TRACE', 'OPTIONS'):
+    st, hdr, _ = req(m_, '/', headers={'Origin': 'https://evil.example', 'Access-Control-Request-Method': 'POST'})
+    codes[m_] = st
     cors += [k for k, _ in hdr if k.lower().startswith('access-control-')]
 check('PANEL-16', 'T1190', 'Unusual methods and a CORS preflight from another origin (PUT, DELETE, PATCH, TRACE, OPTIONS)',
       'none succeeds; no CORS header ever sent', all(c >= 400 for c in codes.values()) and not cors,
@@ -133,12 +188,52 @@ for path in ('/../../etc/passwd', '/%2e%2e/%2e%2e/etc/passwd', '/style.css/../..
 check('PANEL-17', 'T1083', 'Path traversal to /etc/passwd and /etc/shadow (5 encodings)', 'no file served',
       not leaked, f'files served: {leaked or "none"}')
 
-results = [login(password=f'guess-{i}')[0] for i in range(5)]
-time.sleep(1)
-st, tok, raw, body = login(code=totp(int(time.time() // 30) + 1))
-check('PANEL-10', 'T1110.001', 'Password guessing (5 wrong), then the right password and code',
-      'account locked: even the right credentials are refused', not tok,
-      f'guesses answered {sorted(set(results))}; then right credentials: HTTP {st}, session: {bool(tok)}')
+before = len(mailbox())
+st, body, pre, csrf = ask_code(ADMIN)
+right = wait_code(ADMIN, before)
+answers = []
+for i in range(5):
+    wrong = str((int(right or '0') + 1 + i) % 10 ** 6).zfill(6)
+    st, tok, _, body = send_code(ADMIN, wrong, pre, csrf)
+    answers.append(st)
+    pre, csrf = form_token()
+st, tok, _, _ = send_code(ADMIN, right, pre, csrf)
+check('PANEL-10', 'T1110.001', 'Guess the 6-digit code (5 wrong), then the right one',
+      'the code is burned after 5 wrong tries: even the right one is refused', bool(right) and not tok,
+      f'guesses answered {sorted(set(answers))}; then the right code: HTTP {st}, session: {bool(tok)}')
+
+before = len(mailbox())
+for _ in range(10):
+    ask_code(ADMIN)
+time.sleep(5)
+n = len(mails_to(ADMIN, mailbox()[before:]))
+check('PANEL-19', 'T1499', 'Flood an admin with sign-in codes (10 requests at once)', 'a few codes at most (3 per address in 10 minutes)',
+      n <= 1, f'codes mailed for 10 requests: {n} (this address had 2 already in the last 10 minutes)')
+
+# the panel's own user, taken over, abuses the root mailer
+before = len(mailbox())
+shadow = subprocess.run(['sha256sum', '/etc/shadow'], capture_output=True, text=True).stdout
+t = int(time.time() * 1000)
+script = f'''
+cd {OUTBOX}
+printf '{{"kind": "code", "email": "{OUTSIDER}", "code": "123456", "at": {time.time()}}}' > {t}-aaaaaaaaaaaaaaaa.json
+printf '{{"kind": "signed-in", "email": "{OUTSIDER}", "at": {time.time()}}}' > {t + 1}-bbbbbbbbbbbbbbbb.json
+ln -s /etc/shadow {t + 2}-cccccccccccccccc.json
+head -c 100000 /dev/zero > {t + 3}-dddddddddddddddd.json
+printf '{{"kind": "code", "email": "{ADMIN}", "code": "not a code", "at": {time.time()}}}' > {t + 4}-eeeeeeeeeeeeeeee.json
+mkdir junk-dir; printf x > notes.txt
+'''
+subprocess.run(['runuser', '-u', 'hgpanel', '--', 'sh', '-c', script], capture_output=True)
+time.sleep(6)
+left = sorted(os.listdir(OUTBOX))
+new = mailbox()[before:]
+leak = 'root:' in new or '$y$' in new or '$6$' in new
+check('PANEL-20', 'T1068', 'The panel\'s own user (if the panel were taken over) feeds the root mailer: a code for an '
+      'outsider, a link to /etc/shadow, a 100 KB file, a bad code, a folder',
+      'nothing mailed to anyone but admins, no link followed, every entry removed',
+      not mails_to(OUTSIDER, new) and not leak and not left and
+      subprocess.run(['sha256sum', '/etc/shadow'], capture_output=True, text=True).stdout == shadow,
+      f'mails to the outsider: {len(mails_to(OUTSIDER, new))}; shadow content mailed: {leak}; left in the outbox: {left or "nothing"}')
 
 for r in out:
     print(json.dumps(r))

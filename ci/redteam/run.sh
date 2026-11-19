@@ -28,7 +28,7 @@ mkdir -p "$OUT"
 cleanup() {
   for c in target floci $CLIENTS; do docker rm -f "hgrt-$c" >/dev/null 2>&1; done
   docker network rm "$NET" >/dev/null 2>&1
-  docker volume rm hgrt-keys >/dev/null 2>&1
+  docker volume rm hgrt-keys hgrt-mail >/dev/null 2>&1
 }
 [ "${KEEP:-0}" = 1 ] || trap cleanup EXIT     # KEEP=1 leaves the containers up to look around
 cleanup
@@ -55,11 +55,12 @@ mailed() { T "grep -q -- '$1' /var/mail/hg-captured"; }
 echo "==> network and containers"
 docker network create "$NET" >/dev/null
 docker volume create hgrt-keys >/dev/null
+docker volume create hgrt-mail >/dev/null      # the admins' inbox: the browser reads its sign-in code there
 docker run --rm -v hgrt-keys:/keys "$IMG" bash -c 'apt-get -qq update >/dev/null && apt-get -qq install -y openssh-client >/dev/null 2>&1
   for k in ops intruder root; do ssh-keygen -q -t ed25519 -N "" -C "$k@redteam" -f /keys/$k; done; chmod 644 /keys/*'
 docker run -d --name hgrt-floci --network "$NET" --network-alias floci "$FLOCI" >/dev/null
 docker run -d --init --name hgrt-target --hostname target --network "$NET" --network-alias target \
-  --cap-add NET_ADMIN --cap-add NET_RAW -v "$REPO:/src:ro" -v "$DIST:/dist:ro" -v hgrt-keys:/keys:ro "$IMG" sleep infinity >/dev/null
+  --cap-add NET_ADMIN --cap-add NET_RAW -v "$REPO:/src:ro" -v "$DIST:/dist:ro" -v hgrt-keys:/keys:ro -v hgrt-mail:/var/mail "$IMG" sleep infinity >/dev/null
 for c in $CLIENTS; do
   docker run -d --name "hgrt-$c" --network "$NET" -v hgrt-keys:/keys:ro "$IMG" sleep infinity >/dev/null
 done
@@ -223,10 +224,9 @@ m['sent'].append({'at': time.time(), 'subject': '<script>document.title=\\'XSS\\
 json.dump(m, open('/var/lib/host-guard/mail-log.json', 'w'))
 PYEOF
 hostguard export >/dev/null"
-docker run --rm --network container:hgrt-target -v "$REPO:/src:ro" -v "$OUT:/out" -e OUT=/out "$BROWSER" \
+docker run --rm --network container:hgrt-target -v "$REPO:/src:ro" -v "$OUT:/out" -v hgrt-mail:/mail:ro -e OUT=/out "$BROWSER" \
   sh -c 'pip install -q --no-cache-dir playwright==1.55.0 >/dev/null 2>&1 && python3 /src/ci/redteam/browser_attack.py'   > "$OUT/browser.jsonl" 2>"$OUT/browser.err" || tail -5 "$OUT/browser.err"
 grep -q '"GUI-2"' "$OUT/browser.jsonl" || record GUI-0 T1078 "The browser stage ran" "it ran" FAIL "no browser results: $(tail -1 "$OUT/browser.err" | cut -c1-150)"
-sleep 31        # a fresh authenticator step: the panel rightly refuses a code used once already
 
 echo "==> Panel (raw HTTP through the tunnel)"
 T 'python3 /src/ci/redteam/panel_attack.py' > "$OUT/panel.jsonl" 2>"$OUT/panel.err"

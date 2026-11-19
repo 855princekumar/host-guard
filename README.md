@@ -11,7 +11,7 @@ For anyone running a product on a single cloud instance, VPS or bare-metal box w
 
 [![CI](https://github.com/855princekumar/host-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/855princekumar/host-guard/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.3.0-blue)](CHANGELOG.md)
+[![PyPI](https://img.shields.io/pypi/v/host-guard)](https://pypi.org/project/host-guard/)
 [![CodeQL](https://github.com/855princekumar/host-guard/actions/workflows/codeql.yml/badge.svg)](https://github.com/855princekumar/host-guard/actions/workflows/codeql.yml)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](CONTRIBUTING.md)
 
@@ -22,7 +22,7 @@ For anyone running a product on a single cloud instance, VPS or bare-metal box w
 
 [![Bandit](https://img.shields.io/badge/security%20lint-Bandit-yellow)](.github/workflows/ci.yml)
 [![gitleaks](https://img.shields.io/badge/secret%20scan-gitleaks-blueviolet)](.github/workflows/ci.yml)
-[![Red team](https://img.shields.io/badge/red%20team-43%20attacks%20stopped%2C%203%20gaps%20open-c0392b)](docs/REDTEAM.md)
+[![Red team](https://img.shields.io/badge/red%20team-52%20attacks%20stopped%2C%203%20gaps%20open-c0392b)](docs/REDTEAM.md)
 [![Rollback](https://img.shields.io/badge/install-manifest%20%2B%20rollback-success)](docs/VERSIONS.md)
 [![No agent](https://img.shields.io/badge/agent-none-lightgrey)](#why-host-guard)
 
@@ -64,10 +64,10 @@ security updates.
 
 ## Proven by attack
 
-Every change is attacked in CI before it can merge: 46 real attacks on an isolated
+Every change is attacked in CI before it can merge: 55 real attacks on an isolated
 network against a server installed by the version manager, plus the dashboard attacked
 from a real browser, each mapped to MITRE ATT&CK.
-**43 stopped or detected, 3 known gaps, 0 failed.** The suite lives in
+**52 stopped or detected, 3 known gaps, 0 failed.** The suite lives in
 [ci/redteam/](ci/redteam/) and runs as the `Red team` job, required for every merge and release.
 
 | Phase | Attacks | Result |
@@ -78,8 +78,9 @@ from a real browser, each mapped to MITRE ATT&CK.
 | Network: mining-pool egress, port scan | 2 | 1 stopped, 1 gap |
 | Backups: theft, tampering of the off-site copy, restore | 4 | 4 stopped |
 | Secrets: leaks, file permissions, panel account | 3 | 3 stopped |
-| Dashboard in a real browser: sign-in, screenshots | 2 | 2 stopped |
-| Dashboard attacks: DNS rebinding, CSRF, CORS, framing, stored XSS, SQL injection, session fixation and theft, code replay, guessing, methods, path traversal | 17 | 16 stopped, 1 gap |
+| Dashboard in a real browser: sign-in with the mailed code, screenshots | 2 | 2 stopped |
+| Dashboard attacks: DNS rebinding, CSRF, CORS, framing, stored XSS, SQL injection, session fixation and theft, code replay and guessing, address enumeration, code flooding, a taken-over panel abusing the root mailer, methods, path traversal | 21 | 20 stopped, 1 gap |
+| The pip package: tampered or planted files, dependencies, startup code, write access | 5 | 5 stopped |
 
 Known gaps, reported rather than hidden: a miner renamed like a kernel thread, run from /usr/local/bin; a port scan of 20 common ports; stolen session cookie replayed from another browser.
 The suite found and fixed five real defects on its first runs.
@@ -184,10 +185,12 @@ panel's security split): [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md).
 
 ## The dashboard (optional)
 
-One page with everything host-guard knows, for the admin: open problems, health,
+One page with everything host-guard knows, for the admins: open problems, health,
 intrusion watch, bans, backups and restore tests, scans, early warning and recent mails.
-Password (scrypt) plus an authenticator code; it runs as an unprivileged user that
-cannot read any secret, and listens on `127.0.0.1` only.
+**No password**: an admin types their email address and signs in with the 6-digit code
+mailed to it (single use, 10 minutes); every sign-in is mailed to all admins. The admins are
+the `--mail-to` addresses. It runs as an unprivileged user that cannot read any secret
+(root mails the codes, and only to admins), and listens on `127.0.0.1` only.
 
 <p align="center">
 <img src="docs/assets/panel-signin.png" alt="The panel's sign-in page" width="40%">
@@ -202,7 +205,9 @@ ssh -N -L 8650:127.0.0.1:8650 you@your-server        # then http://127.0.0.1:865
 
 AWS SSM, Google IAP, Azure Bastion and OCI Bastion tunnels work the same way:
 [docs/PANEL.md](docs/PANEL.md#open-it). Every change is attacked in a real browser in CI
-(stored script injection, CORS, cross-site posts, framing, session fixation, guessing).
+(sign-in with the code from the mailbox, address enumeration, code flooding, a taken-over
+panel abusing the mailer, stored script injection, CORS, cross-site posts, framing, session
+fixation, guessing).
 
 ## Everyday commands
 
@@ -231,7 +236,7 @@ python ci/build_dist.py && docker run --rm -v "$PWD:/src:ro" -v "$PWD/dist:/dist
 | Install, upgrade, rollback, uninstall (same three) | the pip package through its whole life; after `uninstall --purge` the server is byte-for-byte as before |
 | Database backups and restore tests | real MariaDB and PostgreSQL, restored into throwaway databases |
 | Package | sdist and wheel carry what runs on a server; `twine check`; VERSION matches the changelog |
-| Red team | 46 real attacks on an isolated network, scored per MITRE ATT&CK; a failed defense fails CI |
+| Red team | 55 real attacks on an isolated network, scored per MITRE ATT&CK; a failed defense fails CI |
 | Clouds | AWS, Google Cloud, Azure, Oracle Cloud and bare metal detected; backups off-site to emulated stores and restore-tested; forged signatures refused |
 | CodeQL (Python, Actions) | security-extended queries on every change and weekly |
 | Lint, Bandit, gitleaks, ShellCheck, systemd units | code quality, security patterns, no secret in the whole history, unit files valid |
