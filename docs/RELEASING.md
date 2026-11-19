@@ -22,12 +22,12 @@ flowchart LR
 | Check | Where | What it proves |
 |---|---|---|
 | Contents | `ci/package_audit.py` | only `host_guard/` and its metadata; no tests, bytecode, `.pth` file, key, database, `.env` or git folder |
-| No drift | `ci/package_audit.py` | every shipped file is byte-for-byte the repository's, and nothing that should ship is missing |
+| No drift | `ci/package_audit.py` | every shipped file is byte-for-byte the repository's, nothing that should ship is missing, and nothing else is in the wheel |
 | RECORD | `ci/package_audit.py` | every file has the SHA-256 its RECORD lists |
 | Metadata | `ci/package_audit.py` | name, version, Python 3.10+, MIT, the project URL, one entry point, **no dependencies at all** (nothing to confuse or typosquat) |
 | Archives | `ci/package_audit.py` | no absolute path, `..`, link, device, setuid or world-writable file |
 | Reproducible | `ci/package_audit.py --rebuild` | a second build from the same commit is bit for bit the same file |
-| Tamper refused | `ci/package_audit.py --smoke`, red team PKG-1, PKG-2 | the version manager checks its files against RECORD before anything runs as root: a changed or added file stops it |
+| Tamper refused | `ci/package_audit.py --smoke`, red team PKG-1, PKG-2 | the version manager checks its files against RECORD before anything runs as root: a changed, missing or added file or a link stops it (accidents and non-root changes; root can change anything, and PKG-4 checks only root can write the install) |
 | Secrets | package job | gitleaks over everything the wheel and sdist carry |
 | Attacked | red team, clouds | the red team installs that wheel with pipx and attacks it (46 attacks plus 5 on the package); the cloud emulators run its `hostguard` |
 | Published = tested | `ci/verify_pypi.py` | PyPI's files and the files its host serves have the tested SHA-256s; each has a provenance attestation from this repository's `release.yml` |

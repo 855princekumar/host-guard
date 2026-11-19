@@ -25,6 +25,11 @@ on:
 permissions:
   contents: read
 
+# bash -eo pipefail: a failing check piped into tee fails its step (audit 0.3.1)
+defaults:
+  run:
+    shell: bash
+
 jobs:
   ci:
     name: CI
@@ -42,7 +47,7 @@ jobs:
     name: Version, changelog and audit gates
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7
         with:
           fetch-depth: 0
       - name: The tag is on main (merged through a pull request with every check)
@@ -67,11 +72,11 @@ jobs:
     needs: [ci, codeql, gates]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0   # v7
         with:
           python-version: "3.12"
-      - uses: actions/download-artifact@v6          # CI's wheel and sdist: the files every test ran on
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53   # v6
         with:
           name: dist
           path: dist
@@ -84,7 +89,7 @@ jobs:
           (cd dist && sha256sum host_guard-* > ../SHA256SUMS) && cat SHA256SUMS >> "$GITHUB_STEP_SUMMARY"
           awk -v v="$(cat VERSION)" '$0 ~ "^## \\[" v "\\]" {on=1; next} /^## \[/ {on=0} on' CHANGELOG.md > notes.md
           test -s notes.md
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4   # v5
         with:
           name: release-extras
           path: |
@@ -101,7 +106,7 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53   # v6
         with:
           name: dist
           path: dist
@@ -115,13 +120,13 @@ jobs:
     needs: pypi
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53   # v6
         with:
           name: dist
           path: dist
       - run: python3 ci/verify_pypi.py "$(cat VERSION)" dist pypi-dist | tee -a "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4   # v5
         with:
           name: from-pypi
           path: pypi-dist/
@@ -135,8 +140,8 @@ jobs:
       matrix:
         os: ["ubuntu:24.04", "ubuntu:26.04", "debian:12"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1   # v7
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53   # v6
         with:
           name: from-pypi
           path: pypi-dist
@@ -156,11 +161,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53   # v6
         with:
           name: dist
           path: dist
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53   # v6
         with:
           name: release-extras
       - env:

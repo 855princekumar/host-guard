@@ -4,8 +4,9 @@
 
 ### Added
 - **The package checks itself**: before anything runs as root, the version manager compares
-  every file of its pip install with the package's SHA-256 RECORD; a changed or added file
-  stops it with the command to reinstall.
+  every file of its pip install with the package's SHA-256 RECORD; a changed, missing or added
+  file, or any symbolic link, stops it with the command to reinstall. It catches accidents and
+  changes by anyone who is not root (the pipx install is root's); root can change anything.
 - **Published = tested**: CI builds the wheel once (reproducibly) and audits it
   (`ci/package_audit.py`: contents, no drift from the repository, RECORD, metadata with no
   dependencies, archive safety, secrets, a smoke install that must refuse a tampered file);
@@ -16,6 +17,12 @@
 - Red team: 5 attacks on the pip package (PKG-1 to PKG-5): a tampered or planted file in the
   installed package is refused before anything runs as root; no dependencies, no `.pth` file
   that runs code, nothing writable by non-root users.
+
+### Security
+- Audit of the changes ([docs/audits/0.3.1.md](docs/audits/0.3.1.md)): every workflow step runs
+  with pipefail (a failing package audit or PyPI check could not fail its step); every wheel
+  file must map to the repository; the build backend and every action are pinned; `v*` tags can
+  be created only by repository admins.
 
 ### Changed
 - The release publishes the wheel and sdist CI built and tested (no second build), attaches

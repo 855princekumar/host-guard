@@ -180,29 +180,37 @@ def find_payload():
 
 def verify_payload(payload):
     """The files a pip install brought must still be exactly what the package's RECORD lists
-    (SHA-256 of each): a payload changed after install (by anyone who could write the
-    site-packages folder) is refused before anything of it runs as root. A git checkout or
-    the copy in /opt/host-guard has no RECORD and is not checked here. Returns the number of
-    files checked."""
+    (SHA-256 of each), before anything of them runs as root: a file changed, missing or added
+    after install, or any symbolic link in the payload, stops it. This catches accidents and
+    changes by anyone who can write the install but is not root (pipx under /opt/pipx is
+    root's, so an ordinary user cannot); root can change anything, this check included. A git
+    checkout or the copy in /opt/host-guard is not a pip install and is not checked here.
+    Returns the number of files checked."""
     here = os.path.dirname(os.path.abspath(__file__))
     if os.path.realpath(payload) != os.path.realpath(os.path.join(here, 'payload')):
         return 0
-    try:
-        from importlib import metadata
-        dist = metadata.distribution('host-guard')
-        files = dist.files or []
-    except Exception:
-        return 0
     import base64
+    import csv
+    import io
+    site = os.path.dirname(here)
+    infos = glob.glob(os.path.join(site, 'host_guard-*.dist-info', 'RECORD'))
+    if len(infos) != 1:
+        raise Fail(f'the host-guard package has {len(infos)} RECORD files next to it (expected one): reinstall it')
     want = {}
-    for f in files:
-        parts = str(f).replace('\\', '/').split('/')
-        if parts[:2] == ['host_guard', 'payload'] and f.hash and f.hash.mode == 'sha256':
-            want[os.path.realpath(f.locate())] = f.hash.value
+    for row in csv.reader(io.StringIO(open(infos[0], encoding='utf-8').read())):
+        if row and row[0].startswith('host_guard/payload/') and row[1].startswith('sha256='):
+            want[os.path.normpath(os.path.join(site, row[0]))] = row[1][7:]
     if not want:
-        return 0
+        raise Fail(f'{infos[0]} lists no payload files: reinstall the package')
     bad = []
+    for d, dirs, names in os.walk(payload):
+        bad += [f'link: {os.path.join(d, x)}' for x in dirs + names if os.path.islink(os.path.join(d, x))]
+        dirs[:] = [x for x in dirs if x != '__pycache__' and not os.path.islink(os.path.join(d, x))]
+        bad += [f'added: {os.path.join(d, n)}' for n in names
+                if os.path.normpath(os.path.join(d, n)) not in want and not os.path.islink(os.path.join(d, n))]
     for path_, value in sorted(want.items()):
+        if os.path.islink(path_):
+            continue                                       # reported above
         try:
             with open(path_, 'rb') as fh:
                 got = base64.urlsafe_b64encode(hashlib.sha256(fh.read()).digest()).rstrip(b'=').decode()
@@ -211,9 +219,6 @@ def verify_payload(payload):
             continue
         if got != value:
             bad.append(f'changed: {path_}')
-    for d, dirs, names in os.walk(payload):
-        dirs[:] = [x for x in dirs if x != '__pycache__']
-        bad += [f'added: {os.path.join(d, n)}' for n in names if os.path.realpath(os.path.join(d, n)) not in want]
     if bad:
         raise Fail('the installed host-guard package was changed after it was installed, so nothing of it runs:\n  '
                    + '\n  '.join(bad[:20]) + '\nReinstall it from PyPI:  sudo PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin '
