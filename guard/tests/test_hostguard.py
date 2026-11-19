@@ -660,8 +660,14 @@ def test_a_broken_certificate_date_or_lag_never_stops_the_health_run(hg, monkeyp
 
 
 # ---------------------------------------------------------------- the panel's sign-in mails
+def me():
+    import pwd
+    return pwd.getpwuid(os.getuid()).pw_name
+
+
 def drop(box, name, data):
-    os.makedirs(box, exist_ok=True)
+    os.makedirs(box, mode=0o700, exist_ok=True)
+    os.chmod(box, 0o700)
     p = os.path.join(box, name)
     with open(p, 'w', encoding='utf-8') as f:
         f.write(data if isinstance(data, str) else json.dumps(data))
@@ -676,7 +682,7 @@ def sent_to(hg):
 
 def test_a_sign_in_code_goes_only_to_that_admin_and_only_to_admins(hg, tmp_path):
     box = str(tmp_path / 'outbox')
-    hg.C.update({'PANEL_OUTBOX': box, 'PANEL_USER': 'no-such-user', 'MAIL_TO': 'a@example.com, b@example.com'})
+    hg.C.update({'PANEL_OUTBOX': box, 'PANEL_USER': me(), 'MAIL_TO': 'a@example.com, b@example.com'})
     t = time.time()
     drop(box, f'{int(t * 1000)}-{"1" * 16}.json', {'kind': 'code', 'email': 'B@example.com', 'code': '123456', 'at': t})
     drop(box, f'{int(t * 1000) + 1}-{"2" * 16}.json', {'kind': 'code', 'email': 'evil@example.org', 'code': '654321', 'at': t})
@@ -695,9 +701,9 @@ def test_the_outbox_follows_no_link_and_removes_everything(hg, tmp_path):
     box = str(tmp_path / 'outbox')
     secret = tmp_path / 'shadow'
     secret.write_text('root:$6$hash')
-    hg.C.update({'PANEL_OUTBOX': box, 'PANEL_USER': 'no-such-user', 'MAIL_TO': 'a@example.com'})
+    hg.C.update({'PANEL_OUTBOX': box, 'PANEL_USER': me(), 'MAIL_TO': 'a@example.com'})
     t = int(time.time() * 1000)
-    os.makedirs(box)
+    os.makedirs(box, mode=0o700)
     if os.name != 'nt':
         os.symlink(secret, os.path.join(box, f'{t}-{"a" * 16}.json'))
     drop(box, f'{t + 1}-{"b" * 16}.json', 'x' * 5000)
@@ -709,7 +715,7 @@ def test_the_outbox_follows_no_link_and_removes_everything(hg, tmp_path):
 
 def test_codes_are_limited_even_if_the_panel_floods_the_outbox(hg, tmp_path):
     box = str(tmp_path / 'outbox')
-    hg.C.update({'PANEL_OUTBOX': box, 'PANEL_USER': 'no-such-user', 'MAIL_TO': 'a@example.com', 'MAIL_MAX_PER_HOUR': '1'})
+    hg.C.update({'PANEL_OUTBOX': box, 'PANEL_USER': me(), 'MAIL_TO': 'a@example.com', 'MAIL_MAX_PER_HOUR': '1'})
     t = time.time()
     for i in range(8):
         drop(box, f'{int(t * 1000) + i}-{str(i) * 16}.json', {'kind': 'code', 'email': 'a@example.com', 'code': f'{i}' * 6, 'at': t})
@@ -719,9 +725,61 @@ def test_codes_are_limited_even_if_the_panel_floods_the_outbox(hg, tmp_path):
 
 def test_a_sign_in_is_announced_to_every_admin(hg, tmp_path):
     box = str(tmp_path / 'outbox')
-    hg.C.update({'PANEL_OUTBOX': box, 'PANEL_USER': 'no-such-user', 'MAIL_TO': 'a@example.com b@example.com'})
+    hg.C.update({'PANEL_OUTBOX': box, 'PANEL_USER': me(), 'MAIL_TO': 'a@example.com b@example.com'})
     drop(box, f'{int(time.time() * 1000)}-{"c" * 16}.json', {'kind': 'signed-in', 'email': 'b@example.com', 'at': time.time()})
     hg.panel_outbox()
     mails = sent_to(hg)
     assert len(mails) == 1 and mails[0][0] == 'a@example.com, b@example.com'
     assert 'Dashboard sign-in: b@example.com' in mails[0][1]
+
+
+def test_an_outbox_swapped_for_a_link_reaches_nothing(hg, tmp_path):
+    # a taken-over panel owns the outbox's parent: it can replace the outbox with a link to
+    # any folder; root must neither read nor empty that folder
+    victim = tmp_path / 'etc'
+    (victim / 'sub').mkdir(parents=True)
+    (victim / 'passwd').write_text('root:x:0:0')
+    (victim / 'sub' / 'keep').write_text('1')
+    os.chmod(victim, 0o700)
+    box = str(tmp_path / 'outbox')
+    os.symlink(victim, box)
+    hg.C.update({'PANEL_OUTBOX': box, 'PANEL_USER': me(), 'MAIL_TO': 'a@example.com'})
+    hg.panel_outbox()
+    assert sorted(os.listdir(victim)) == ['passwd', 'sub'] and (victim / 'sub' / 'keep').exists()
+
+
+def test_an_outbox_others_can_write_or_of_another_user_is_not_read(hg, tmp_path):
+    box = str(tmp_path / 'outbox')
+    t = time.time()
+    drop(box, f'{int(t * 1000)}-{"d" * 16}.json', {'kind': 'code', 'email': 'a@example.com', 'code': '123456', 'at': t})
+    os.chmod(box, 0o777)
+    hg.C.update({'PANEL_OUTBOX': box, 'PANEL_USER': me(), 'MAIL_TO': 'a@example.com'})
+    hg.panel_outbox()
+    assert not sent_to(hg) and len(os.listdir(box)) == 1
+    os.chmod(box, 0o700)
+    hg.C['PANEL_USER'] = 'no-such-user'
+    hg.panel_outbox()
+    assert not sent_to(hg) and len(os.listdir(box)) == 1
+
+
+def test_a_hard_link_in_the_outbox_is_not_read(hg, tmp_path):
+    box = str(tmp_path / 'outbox')
+    other = tmp_path / 'other.json'
+    t = time.time()
+    other.write_text(json.dumps({'kind': 'code', 'email': 'a@example.com', 'code': '123456', 'at': t}))
+    os.makedirs(box, mode=0o700)
+    os.link(other, os.path.join(box, f'{int(t * 1000)}-{"e" * 16}.json'))
+    hg.C.update({'PANEL_OUTBOX': box, 'PANEL_USER': me(), 'MAIL_TO': 'a@example.com'})
+    hg.panel_outbox()
+    assert not sent_to(hg) and os.listdir(box) == [] and other.exists()
+
+
+def test_sign_in_notices_are_limited_even_if_the_panel_floods_the_outbox(hg, tmp_path):
+    box = str(tmp_path / 'outbox')
+    hg.C.update({'PANEL_OUTBOX': box, 'PANEL_USER': me(), 'MAIL_TO': 'a@example.com b@example.com'})
+    t = time.time()
+    for i in range(12):
+        drop(box, f'{int(t * 1000) + i}-{str(i % 10) * 15}{i % 10}.json',
+             {'kind': 'signed-in', 'email': 'a@example.com', 'at': t})
+    hg.panel_outbox()
+    assert len(sent_to(hg)) == 5 and os.listdir(box) == []

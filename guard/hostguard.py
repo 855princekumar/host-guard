@@ -1926,38 +1926,77 @@ def panel_admins():
     return {a.lower() for a in re.split(r'[,\s]+', raw.strip()) if a and EMAIL.match(a)}
 
 
+def _remove_in(dfd, name, depth=0):
+    """Remove the entry `name` of the directory open as `dfd`, never following a link: a
+    folder is opened by its descriptor and emptied the same way (the panel creates none; this
+    only clears what a taken-over panel might leave)."""
+    import stat as st_
+    try:
+        info = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        if not st_.S_ISDIR(info.st_mode):
+            os.unlink(name, dir_fd=dfd)
+            return
+        if depth > 8:
+            return
+        sub = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+        try:
+            for n in os.listdir(sub):
+                _remove_in(sub, n, depth + 1)
+        finally:
+            os.close(sub)
+        os.rmdir(name, dir_fd=dfd)
+    except OSError:
+        pass
+
+
 def panel_outbox():
     """Mail what the panel left in its outbox: a sign-in code (only to that address, and only
     if it is an admin) or a sign-in notice (to every admin). The panel runs unprivileged and
     cannot read the mail password; this runs as root (host-guard-panel-mail.path) and trusts
-    nothing in the folder: no link is followed, only small regular files of the panel's own
-    user are read, every entry is removed, and codes are limited to 5 per address in
-    15 minutes and 30 an hour in all, even if the panel itself were taken over."""
+    nothing the panel controls: the outbox is opened once, without following a link, and must
+    be a folder of the panel's own user; every read and removal goes through that open folder,
+    so swapping the outbox for a link to another folder reaches nothing. Only small regular
+    files of the panel's user are read, every entry is removed, codes are limited to 5 per
+    address in 15 minutes and 30 an hour, and sign-in notices to 5 per address and 20 an hour,
+    even if the panel itself were taken over."""
     import pwd
     import stat as st_
-    d = C['PANEL_OUTBOX']
     try:
-        names = sorted(os.listdir(d))
+        uid = pwd.getpwnam(C['PANEL_USER']).pw_uid
+    except (KeyError, ImportError):
+        print(f'panel-outbox: no user {C["PANEL_USER"]}, nothing read')
+        return
+    try:
+        dfd = os.open(C['PANEL_OUTBOX'], os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError:
         print('panel-outbox: nothing to do')
         return
     try:
-        uid = pwd.getpwnam(C['PANEL_USER']).pw_uid
-    except (KeyError, ImportError):
-        uid = None
+        info = os.fstat(dfd)
+        if not st_.S_ISDIR(info.st_mode) or info.st_uid != uid or info.st_mode & 0o077:
+            print(f'panel-outbox: {C["PANEL_OUTBOX"]} is not the 0700 folder of {C["PANEL_USER"]}, nothing read')
+            return
+        _panel_outbox(dfd, uid)
+    finally:
+        os.close(dfd)
+
+
+def _panel_outbox(dfd, uid):
+    import stat as st_
+    names = sorted(os.listdir(dfd))
     admins = panel_admins()
     s = load('panel-mail.json')
     sent = [x for x in s.get('sent', []) if x.get('at', 0) > now() - 3600]
+    told = [x for x in s.get('notices', []) if x.get('at', 0) > now() - 3600]
     done = refused = 0
     for n in names:
-        p = os.path.join(d, n)
         data = None
         if OUTBOX_NAME.match(n):
             fd = None
             try:
-                fd = os.open(p, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+                fd = os.open(n, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
                 info = os.fstat(fd)
-                if st_.S_ISREG(info.st_mode) and info.st_size <= 2048 and (uid is None or info.st_uid == uid):
+                if st_.S_ISREG(info.st_mode) and info.st_size <= 2048 and info.st_uid == uid and info.st_nlink == 1:
                     data = json.loads(os.read(fd, 2049).decode('utf-8'))
             except (OSError, ValueError):
                 data = None
@@ -1966,17 +2005,11 @@ def panel_outbox():
                     os.close(fd)
         elif n.endswith('.tmp'):
             try:
-                if now() - os.lstat(p).st_mtime < 60:
+                if 0 <= now() - os.stat(n, dir_fd=dfd, follow_symlinks=False).st_mtime < 60:
                     continue                                 # being written right now
             except OSError:
                 continue
-        try:                                                 # every entry goes, used or not (no endless trigger)
-            if os.path.isdir(p) and not os.path.islink(p):
-                shutil.rmtree(p)
-            else:
-                os.unlink(p)
-        except OSError:
-            pass
+        _remove_in(dfd, n)                                   # every entry goes, used or not (no endless trigger)
         if not isinstance(data, dict):
             refused += 1
             continue
@@ -1988,28 +2021,34 @@ def panel_outbox():
         if email not in admins or not fresh:
             refused += 1                                     # not an admin: nothing is sent, the panel cannot tell
             continue
-        if kind == 'code' and re.fullmatch(r'\d{6}', str(data.get('code', ''))):
+        if kind == 'code' and re.fullmatch(r'[0-9]{6}', str(data.get('code', ''))):
             mine = [x for x in sent if x['email'] == email and x['at'] > now() - 900]
             if len(mine) >= 5 or len(sent) >= 30:
                 refused += 1
                 print(f'panel-outbox: code for {email} not sent (limit reached)')
                 continue
             mail(subject='Your dashboard sign-in code', category='Sign-in', level='info', to=[email], body=
-                 f'Code: {data["code"]}\n\nIt works once, for 10 minutes, on the host-guard dashboard of {C["SITE"]}.\n\n'
+                 f'Code: {data["code"]}\n\nIt works once, for 10 minutes, on the host-guard dashboard of {C["SITE"]}, '
+                 'in the browser that asked for it.\n\n'
                  'Did you not ask for it? Someone who can reach the dashboard (it is only reachable through a '
                  'tunnel to this server) entered your address. Nothing happens without the code. Tell the other '
                  'admins, and look at the audit log: sudo -u hgpanel python3 /usr/local/lib/host-guard-panel/hgpanel.py audit')
             sent.append({'at': now(), 'email': email})
             done += 1
         elif kind == 'signed-in':
+            if len([x for x in told if x['email'] == email]) >= 5 or len(told) >= 20:
+                refused += 1
+                print(f'panel-outbox: sign-in notice for {email} not sent (limit reached)')
+                continue
             mail(subject=f'Dashboard sign-in: {email}', category='Sign-in', level='info', body=
                  f'{email} signed in to the host-guard dashboard of {C["SITE"]} at {stamp()}.\n\n'
                  'Not expected? The session ends after 15 minutes idle or 8 hours. Look at the audit log: '
                  'sudo -u hgpanel python3 /usr/local/lib/host-guard-panel/hgpanel.py audit')
+            told.append({'at': now(), 'email': email})
             done += 1
         else:
             refused += 1
-    s['sent'] = sent
+    s['sent'], s['notices'] = sent, told
     save(s, 'panel-mail.json')
     print(f'panel-outbox: {done} mailed, {refused} refused')
 

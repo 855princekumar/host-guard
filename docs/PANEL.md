@@ -74,8 +74,8 @@ signed in through the panel's own form), with the red team's attack traffic in t
 | Privilege | runs as `hgpanel`: no shell, no home, no capabilities, read-only system, private /tmp, system-call filter (`systemd-analyze security` exposure about 1.3) |
 | Secrets | cannot read `/etc/host-guard`, `/var/lib/host-guard` or the backups (also blocked in the unit); root's `hostguard export` writes a status file without secrets into a folder the panel can read but not write |
 | Who may sign in | only the admin addresses (`PANEL_ADMINS`, else `MAIL_TO`), decided by root, not by the panel: the panel never learns the list, so it answers every address the same way and nobody can find out which addresses are admins |
-| Codes | 6 random digits; only a salted SHA-256 is stored; single use; 10 minutes; 5 wrong tries burn the code; 3 requests per address in 10 minutes |
-| Mailing | the panel cannot read the mail password: it leaves the request in its outbox (`/var/lib/host-guard-panel/outbox`, its own, 0700) and the root service `host-guard-panel-mail.path` runs `hostguard panel-outbox`, which mails a code only to that admin, at most 5 per address in 15 minutes and 30 an hour, follows no link, reads only small files of the panel's user and removes every entry; so even a panel that was taken over cannot mail anyone but the admins, or mail them much |
+| Codes | 6 random digits; only a salted SHA-256 is stored; single use; 10 minutes; usable only in the browser that asked for it (an `hg_ask` cookie), so nobody else can replace, burn or use an admin's code; 5 wrong tries burn it, counted even while guessing is blocked; 3 requests per browser and address, 10 per address, in 10 minutes |
+| Mailing | the panel cannot read the mail password: it leaves the request in its outbox (`/var/lib/host-guard-panel/outbox`, its own, 0700) and the root service `host-guard-panel-mail.path` runs `hostguard panel-outbox` (sandboxed by systemd), which mails a code only to that admin, at most 5 per address in 15 minutes and 30 an hour (sign-in notices: 5 per address, 20 an hour); it opens the outbox once, refuses it unless it is a 0700 folder of the panel's user, and reads and removes entries only through that open folder (a link put in place of the outbox reaches nothing), reads only small regular files of the panel's user and removes every entry; so even a panel that was taken over cannot mail anyone but the admins, mail them much, or touch anything outside its outbox |
 | Guessing | 10 failures in 15 minutes block further guesses (every visitor arrives through the tunnel as 127.0.0.1, so the right code still gets in: nobody can lock the admins out this way) |
 | Notice | every sign-in is mailed to all admins |
 | Sessions | 256-bit random token, only its SHA-256 stored; cookie HttpOnly, SameSite=Strict, Secure; 15 minutes idle, 8 hours at most; a new token at every sign-in |
@@ -125,7 +125,7 @@ sequenceDiagram
 | `ALLOWED_HOSTS` | empty | extra accepted `Host` headers, comma separated |
 | `COOKIE_SECURE` | `1` | browsers accept Secure cookies on 127.0.0.1 and localhost |
 | `IDLE_MIN`, `MAX_HOURS` | `15`, `8` | session limits |
-| `CODE_MIN`, `CODE_TRIES`, `CODE_REQUESTS` | `10`, `5`, `3` | a code's life in minutes, wrong tries before it is burned, requests per address in 10 minutes |
+| `CODE_MIN`, `CODE_TRIES`, `CODE_REQUESTS`, `CODE_REQUESTS_ALL` | `10`, `5`, `3`, `10` | a code's life in minutes, wrong tries before it is burned, requests per browser and address, and per address in all, in 10 minutes |
 | `LOCK_MIN`, `IP_LIMIT` | `15`, `10` | failures in that many minutes that block further guesses |
 | `DB`, `STATUS_FILE`, `OUTBOX` | `/var/lib/host-guard-panel/panel.db`, `/var/lib/host-guard-export/status.json`, `/var/lib/host-guard-panel/outbox` | files |
 

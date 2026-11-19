@@ -4,3 +4,15 @@ Description=host-guard: mail the panel's sign-in codes (to admin addresses only)
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/hostguard panel-outbox
+# root, because it reads the mail password; the panel cannot make it touch the system
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=full
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+TimeoutStartSec=120

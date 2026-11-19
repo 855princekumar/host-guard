@@ -62,13 +62,14 @@ def mails_to(addr, text=None):
 
 
 def ask_code(email, csrf_override=None):
-    """POST the address; returns (status, page, pre cookie, form token for the code form)."""
+    """POST the address; returns (status, page, the cookies for the code form, its form token).
+    The cookies hold hg_ask too: a code works only in the browser that asked for it."""
     pre, csrf = form_token()
     st, hdr, body = req('POST', '/login', {'email': email, 'csrf': csrf if csrf_override is None else csrf_override},
                         {'Cookie': f'hg_pre={pre}'})
     jar = cookies_of(hdr)[0]
     m = re.search(r'name="csrf" value="([^"]+)"', body)
-    return st, body, jar.get('hg_pre', ''), (m.group(1) if m else '')
+    return st, body, f"hg_pre={jar.get('hg_pre', '')}; hg_ask={jar.get('hg_ask', '')}", (m.group(1) if m else '')
 
 
 def wait_code(email, before, timeout=25):
@@ -84,14 +85,18 @@ def wait_code(email, before, timeout=25):
 
 
 def send_code(email, code, pre, csrf):
-    st, hdr, body = req('POST', '/login/code', {'email': email, 'code': code, 'csrf': csrf}, {'Cookie': f'hg_pre={pre}'})
+    st, hdr, body = req('POST', '/login/code', {'email': email, 'code': code, 'csrf': csrf}, {'Cookie': pre})
     jar, raw = cookies_of(hdr)
     return st, jar.get('hg_s'), raw, body
+
+
+LAST = {}
 
 
 def sign_in(email=ADMIN):
     before = len(mailbox())
     st, body, pre, csrf = ask_code(email)
+    LAST['cookies'] = pre                                       # that browser's hg_ask, for the replay test
     code = wait_code(email, before)
     st2, tok, raw, body2 = send_code(email, code, pre, csrf)
     return code, st2, tok, raw, body2
@@ -167,9 +172,9 @@ signin = 'name="email"' in body4
 check('PANEL-8', 'T1550.004', 'Reuse of a session cookie after sign-out', 'session gone (sign-in page)',
       signin, f'HTTP {st4b}, sign-in page shown: {signin}')
 
-pre, csrf = form_token()
-st, tok, _, _ = send_code(ADMIN, code, pre, csrf)
-check('PANEL-9', 'T1111', 'Replay of a sign-in code already used', 'refused (single use)', not tok and st == 401, f'HTTP {st}')
+p2, csrf = form_token()
+st, tok, _, _ = send_code(ADMIN, code, f'hg_pre={p2}; ' + LAST['cookies'].split('; ', 1)[1], csrf)   # the same browser
+check('PANEL-9', 'T1111', 'Replay of a sign-in code already used, from the browser that used it', 'refused (single use)', not tok and st == 401, f'HTTP {st}')
 
 codes, cors = {}, []
 for m_ in ('PUT', 'DELETE', 'PATCH', 'TRACE', 'OPTIONS'):
@@ -196,7 +201,8 @@ for i in range(5):
     wrong = str((int(right or '0') + 1 + i) % 10 ** 6).zfill(6)
     st, tok, _, body = send_code(ADMIN, wrong, pre, csrf)
     answers.append(st)
-    pre, csrf = form_token()
+    p2, csrf = form_token()
+    pre = f'hg_pre={p2}; ' + pre.split('; ', 1)[1]                 # same browser (hg_ask), new form token
 st, tok, _, _ = send_code(ADMIN, right, pre, csrf)
 check('PANEL-10', 'T1110.001', 'Guess the 6-digit code (5 wrong), then the right one',
       'the code is burned after 5 wrong tries: even the right one is refused', bool(right) and not tok,
@@ -207,8 +213,10 @@ for _ in range(10):
     ask_code(ADMIN)
 time.sleep(5)
 n = len(mails_to(ADMIN, mailbox()[before:]))
-check('PANEL-19', 'T1499', 'Flood an admin with sign-in codes (10 requests at once)', 'a few codes at most (3 per address in 10 minutes)',
-      n <= 1, f'codes mailed for 10 requests: {n} (this address had 2 already in the last 10 minutes)')
+total = len([p for p in mails_to(ADMIN) if 'Code: ' in p])
+check('PANEL-19', 'T1499', 'Flood an admin with sign-in codes (10 requests at once, each from a new browser)',
+      'a few codes at most (10 requests per address in the panel, 5 code mails per address in 15 minutes by root)',
+      total <= 5, f'codes mailed for these 10 requests: {n}; code mails to this address in the whole run: {total}')
 
 # the panel's own user, taken over, abuses the root mailer
 before = len(mailbox())
@@ -234,6 +242,24 @@ check('PANEL-20', 'T1068', 'The panel\'s own user (if the panel were taken over)
       not mails_to(OUTSIDER, new) and not leak and not left and
       subprocess.run(['sha256sum', '/etc/shadow'], capture_output=True, text=True).stdout == shadow,
       f'mails to the outsider: {len(mails_to(OUTSIDER, new))}; shadow content mailed: {leak}; left in the outbox: {left or "nothing"}')
+
+# the same user swaps its outbox for a link to a root folder: root must not empty it
+os.makedirs('/srv/hg-victim/sub', exist_ok=True)
+for p in ('/srv/hg-victim/keep', '/srv/hg-victim/sub/keep'):
+    with open(p, 'w') as f_:
+        f_.write('root data')
+parent = os.path.dirname(OUTBOX)
+subprocess.run(['runuser', '-u', 'hgpanel', '--', 'sh', '-c',
+                f'cd {parent} && mv outbox outbox.real && ln -s /srv/hg-victim outbox'], capture_output=True)
+time.sleep(6)
+kept = sorted(os.listdir('/srv/hg-victim')) == ['keep', 'sub'] and os.path.exists('/srv/hg-victim/sub/keep')
+swapped = os.path.islink(OUTBOX)
+subprocess.run(['runuser', '-u', 'hgpanel', '--', 'sh', '-c',
+                f'cd {parent} && rm -f outbox && mv outbox.real outbox'], capture_output=True)
+check('PANEL-22', 'T1222', "The panel's own user replaces its outbox with a link to a root folder, so root would "
+      "list and remove that folder's files", 'the root mailer opens the outbox without following a link: nothing outside it is touched',
+      swapped and kept, f'outbox replaced by a link: {swapped}; the root folder after 6 seconds of the mailer: '
+      f'{sorted(os.listdir("/srv/hg-victim"))}, nested file kept: {os.path.exists("/srv/hg-victim/sub/keep")}')
 
 for r in out:
     print(json.dumps(r))
