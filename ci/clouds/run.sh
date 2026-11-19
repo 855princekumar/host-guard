@@ -25,6 +25,8 @@ FLOCI_GCP=floci/floci-gcp@sha256:a59403d43d524b1a08282d67d541a6d37bf7868cbd9d131
 FLOCI_OCI=floci/floci-oci@sha256:088bb759252560921adf1776c9114e62b26ce589f267d4afb13f2ebba20e4a8c
 AZURITE=mcr.microsoft.com/azure-storage/azurite@sha256:647c63a91102a9d8e8000aab803436e1fc85fbb285e7ce830a82ee5d6661cf37
 STORES="floci floci-gcp floci-oci azurite"
+DIST="${DIST:-$REPO/dist}"     # hostguard is taken from the built wheel: exactly what would be published
+ls "$DIST"/host_guard-*.whl >/dev/null 2>&1 || { echo "no wheel in $DIST: python3 ci/build_dist.py first"; exit 1; }
 mkdir -p "$OUT"
 printf '| Cloud | Detected | Off-site store | Backup confirmed | Restore test | Cost section |\n|---|---|---|---|---|---|\n' > "$OUT/results.md"
 fails=0
@@ -46,9 +48,9 @@ AZ_KEY=$(head -c 64 /dev/urandom | base64 | tr -d '\n')      # a fresh storage a
 docker run -d --name azurite --network "$NET" -e AZURITE_ACCOUNTS="$AZ_ACCOUNT:$AZ_KEY" "$AZURITE" azurite-blob --blobHost 0.0.0.0 >/dev/null
 printf 'FROM ubuntu:24.04\nRUN apt-get update -qq && apt-get install -y -qq python3 gnupg tar gzip ca-certificates >/dev/null && rm -rf /var/lib/apt/lists/*\n' \
   | docker build -q -t hg-cloud-target:local - >/dev/null
-docker run -d --name hgc-target --network "$NET" -v "$REPO:/src:ro" hg-cloud-target:local sleep infinity >/dev/null
+docker run -d --name hgc-target --network "$NET" -v "$REPO:/src:ro" -v "$DIST:/dist:ro" hg-cloud-target:local sleep infinity >/dev/null
 T() { docker exec -e AZ_ACCOUNT="$AZ_ACCOUNT" -e AZ_KEY="$AZ_KEY" hgc-target bash -c "$1"; }
-T 'install -m 0755 /src/guard/hostguard.py /usr/local/sbin/hostguard && mkdir -p /etc/host-guard && echo "important data $(date)" > /srv-data.txt'
+T 'python3 -m zipfile -e /dist/host_guard-*.whl /opt/hgpkg && install -m 0755 /opt/hgpkg/host_guard/payload/guard/hostguard.py /usr/local/sbin/hostguard && mkdir -p /etc/host-guard && echo "important data $(date)" > /srv-data.txt'
 for _ in $(seq 30); do T 'python3 -c "import urllib.request as u; [u.urlopen(x, timeout=2) for x in (\"http://floci:4566/\",)]"' >/dev/null 2>&1 && break; sleep 1; done
 sleep 5
 
@@ -115,18 +117,18 @@ KEY=$(docker exec hgc-awsemu sh -c "sed -n 's/^aws_access_key_id *= *//p' /root/
 SECRET=$(docker exec hgc-awsemu sh -c "sed -n 's/^aws_secret_access_key *= *//p' /root/.aws/emulator/9297/emulator_credentials")
 CA=$(docker exec hgc-awsemu cat /root/.aws/emulator/9297/ca.pem)
 emu() {   # a client in the emulator's own network namespace (its certificate is for 127.0.0.1)
-  docker run --rm -i --network container:hgc-awsemu -v "$REPO:/src:ro" -e CA="$CA" -e HG_S3_BUCKET=hg-backups \
+  docker run --rm -i --network container:hgc-awsemu -v "$REPO:/src:ro" -v "$DIST:/dist:ro" -e CA="$CA" -e HG_S3_BUCKET=hg-backups \
     -e HG_S3_ENDPOINT=https://127.0.0.1:9297 -e HG_AWS_REGION=us-east-1 -e HG_S3_CA_BUNDLE=/ca.pem \
     -e HG_AWS_ACCESS_KEY_ID="$KEY" -e HG_AWS_SECRET_ACCESS_KEY="$1" -e HG_BACKUP_PASSPHRASE=aws-emulator-test-passphrase \
     -e HG_BACKUP_CMD='tar -cf - /etc/hostname /etc/os-release' -e HG_BACKUP_MIN_BYTES=10 -e HG_MAIL_TO= -e HG_CLOUD=aws \
     -e HG_NOTIFY_CMD='cat >/dev/null' -e HOSTGUARD_CONF=/nonexistent hg-cloud-target:local bash -c "$2"
 }
-out=$(emu "$SECRET" 'printf "%s\n" "$CA" > /ca.pem; install -m 0755 /src/guard/hostguard.py /usr/local/sbin/hostguard
+out=$(emu "$SECRET" 'printf "%s\n" "$CA" > /ca.pem; python3 -m zipfile -e /dist/host_guard-*.whl /opt/hgpkg && install -m 0755 /opt/hgpkg/host_guard/payload/guard/hostguard.py /usr/local/sbin/hostguard
   python3 -c "import importlib.machinery as m, importlib.util as u; l=m.SourceFileLoader(\"hg\", \"/usr/local/sbin/hostguard\"); s=u.spec_from_loader(\"hg\", l); h=u.module_from_spec(s); l.exec_module(h); print(\"bucket\", h.s3(\"PUT\", \"\")[0])"
   hostguard backup 2>&1 | tail -1; hostguard restore-test 2>&1 | tail -1')
 echo "$out" | sed 's/^/  /'
 ok=1; echo "$out" | grep -q 'off-site=s3' || ok=0; echo "$out" | grep -q 'restore-test: ok' || ok=0
-bad=$(emu 0000000000000000000000000000000000000000 'printf "%s\n" "$CA" > /ca.pem; python3 /src/ci/clouds/store_test.py s3' 2>&1 | tail -1)
+bad=$(emu 0000000000000000000000000000000000000000 'printf "%s\n" "$CA" > /ca.pem; python3 -m zipfile -e /dist/host_guard-*.whl /opt/hgpkg && install -m 0755 /opt/hgpkg/host_guard/payload/guard/hostguard.py /usr/local/sbin/hostguard; python3 /src/ci/clouds/store_test.py s3' 2>&1 | tail -1)
 echo "$bad" | grep -q '"put": 403' || ok=0
 printf '  %-6s %s\n' "$([ $ok = 1 ] && echo PASS || echo FAIL)" "AWS Emulator $EMU_VERSION: signed backup off-site, restore test, a wrong secret refused"
 printf '| aws (AWS Emulator %s) | AWS | s3, SigV4 checked, HTTPS | %s | %s | wrong secret: %s |\n' "$(echo "$EMU_VERSION" | awk '{print $2}')" \

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # The red-team target: a clean Ubuntu server with sshd, nginx (with a rate limit) and rsyslog,
-# host-guard installed by its version manager with the panel, a plain VPS profile and off-site
+# host-guard installed from the built wheel (/dist, the exact file that would be published) with
+# pipx, then by its version manager with the panel, a plain VPS profile and off-site
 # backup copies to an emulated S3 (Floci). Mail is captured to /var/mail/hg-captured instead
 # of being sent. Run by ci/redteam/run.sh inside the target container.
 #
@@ -10,7 +11,7 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq >/dev/null
-apt-get install -y -qq sudo iptables procps openssh-server nginx rsyslog python3 curl netcat-openbsd gnupg >/dev/null 2>&1
+apt-get install -y -qq sudo iptables procps openssh-server nginx rsyslog python3 pipx curl netcat-openbsd gnupg >/dev/null 2>&1
 printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/systemctl
 chmod +x /usr/local/bin/systemctl
 
@@ -49,8 +50,10 @@ EOF
 chmod 755 /usr/local/bin/capture-mail
 python3 -c "import urllib.request; urllib.request.urlopen(urllib.request.Request('http://floci:4566/hg-backups', method='PUT'))"
 
-cd /src
-./host-guard install --mail-to security@example.com --profile examples/profiles/plain-vps.conf \
+export PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin      # as docs/INSTALL.md says
+pipx install /dist/host_guard-*.whl >/dev/null
+cd /
+host-guard install --mail-to security@example.com --profile examples/profiles/plain-vps.conf \
   --login-user ops --web-logs /var/log/nginx --smtp-plain --smtp-host 127.0.0.1 --smtp-port 1025 \
   --s3-bucket hg-backups --s3-endpoint http://floci:4566 --region us-east-1 --with-panel --yes
 

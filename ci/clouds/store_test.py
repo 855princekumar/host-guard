@@ -2,6 +2,7 @@
 """host-guard's own remote() against one emulated store: PUT, HEAD (size), GET (same bytes).
     store_test.py KIND [setting=value ...]     prints one JSON line"""
 import hashlib
+import importlib.machinery
 import importlib.util
 import json
 import os
@@ -9,7 +10,8 @@ import sys
 
 os.environ['HOSTGUARD_CONF'] = '/nonexistent'
 os.environ['HG_STATE_DIR'] = '/tmp/hg-state'
-spec = importlib.util.spec_from_file_location('hostguard', '/src/guard/hostguard.py')
+spec = importlib.util.spec_from_file_location('hostguard', '/usr/local/sbin/hostguard',    # the wheel's copy
+                                              loader=importlib.machinery.SourceFileLoader('hostguard', '/usr/local/sbin/hostguard'))
 hg = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hg)
 

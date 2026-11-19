@@ -17,6 +17,8 @@ PY="${PYTHON:-python3}"
 IMG=ubuntu:24.04
 FLOCI=floci/floci@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be71956eb7a7fce08fc21458e19
 BROWSER=mcr.microsoft.com/playwright/python@sha256:640d578aae63cfb632461d1b0aecb01414e4e020864ac3dd45a868dc0eff3078   # v1.55.0-noble
+DIST="${DIST:-$REPO/dist}"     # the built wheel: the red team attacks exactly what would be published
+ls "$DIST"/host_guard-*.whl >/dev/null 2>&1 || { echo "no wheel in $DIST: python3 ci/build_dist.py first"; exit 1; }
 NET=hg-redteam
 CLIENTS="attacker prober flooder auditor admin"
 START=$(date +%s)
@@ -57,14 +59,14 @@ docker run --rm -v hgrt-keys:/keys "$IMG" bash -c 'apt-get -qq update >/dev/null
   for k in ops intruder root; do ssh-keygen -q -t ed25519 -N "" -C "$k@redteam" -f /keys/$k; done; chmod 644 /keys/*'
 docker run -d --name hgrt-floci --network "$NET" --network-alias floci "$FLOCI" >/dev/null
 docker run -d --init --name hgrt-target --hostname target --network "$NET" --network-alias target \
-  --cap-add NET_ADMIN --cap-add NET_RAW -v "$REPO:/src:ro" -v hgrt-keys:/keys:ro "$IMG" sleep infinity >/dev/null
+  --cap-add NET_ADMIN --cap-add NET_RAW -v "$REPO:/src:ro" -v "$DIST:/dist:ro" -v hgrt-keys:/keys:ro "$IMG" sleep infinity >/dev/null
 for c in $CLIENTS; do
   docker run -d --name "hgrt-$c" --network "$NET" -v hgrt-keys:/keys:ro "$IMG" sleep infinity >/dev/null
 done
 for c in $CLIENTS; do
   C "$c" 'apt-get -qq update >/dev/null && apt-get -qq install -y openssh-client sshpass curl netcat-openbsd >/dev/null 2>&1' &
 done
-echo "==> target: host-guard installed by its version manager (with the panel)"
+echo "==> target: host-guard installed from the built wheel by its version manager (with the panel)"
 if ! T 'bash /src/ci/redteam/target.sh' > "$OUT/target-setup.log" 2>&1; then
   tail -40 "$OUT/target-setup.log"; echo "TARGET SETUP FAILED"; exit 1
 fi
@@ -238,6 +240,32 @@ with open(sys.argv[2], 'a') as out:
                               'result': r['result'], 'evidence': r['evidence']}) + '\n')
         print(f"  {r['result']:<5} {r['id']:<9} {r['attack']}")
 PYEOF
+
+echo "==> The pip package (supply chain)"
+PKGDIR=$(T 'ls -d /opt/pipx/venvs/host-guard/lib/python3*/site-packages/host_guard/payload' 2>/dev/null)
+VPY=/opt/pipx/venvs/host-guard/bin/python
+out=$(T "cp $PKGDIR/guard/install.sh /root/install.sh.orig; echo 'touch /tmp/pkg-pwned' >> $PKGDIR/guard/install.sh
+  host-guard upgrade --yes 2>&1; echo rc=\$?; cp /root/install.sh.orig $PKGDIR/guard/install.sh; ls /tmp/pkg-pwned 2>&1" | tr '\n' ' ')
+record PKG-1 T1195.002 "Tamper with the installed package (a command added to its install.sh), then upgrade as root" \
+  "refused before anything of it runs" \
+  "$(verdict "$(echo "$out" | grep -q 'changed: ' && ! echo "$out" | grep -q 'rc=0' && echo "$out" | grep -q 'No such file' && echo 1)")" "${out:0:220}"
+out=$(T "printf 'import os\n' > $PKGDIR/guard/sitecustomize.py; host-guard upgrade --yes 2>&1; echo rc=\$?; rm -f $PKGDIR/guard/sitecustomize.py" | tr '\n' ' ')
+record PKG-2 T1195.002 "Plant an extra file in the installed package, then upgrade as root" "refused (the file is not in the package's RECORD)" \
+  "$(verdict "$(echo "$out" | grep -q 'added: ' && ! echo "$out" | grep -q 'rc=0' && echo 1)")" "${out:0:220}"
+deps=$(T "$VPY -m pip list --format=freeze 2>/dev/null | grep -viE '^(pip|host-guard)==' | tr '\n' ' '")
+# a .pth line that starts with "import" runs at every Python start; path lines (pipx's own pipx_shared.pth) do not
+pth=$(T "find /opt/pipx/venvs/host-guard -name '*.pth' -exec grep -lE '^[[:space:]]*import[[:space:]]' {} + 2>/dev/null | grep -v '/distutils-precedence.pth$' | tr '\n' ' '")
+allpth=$(T "find /opt/pipx/venvs/host-guard -name '*.pth' -printf '%f ' 2>/dev/null")
+wsha=$(T 'sha256sum /dist/host_guard-*.whl | cut -c1-16')
+record PKG-3 T1195.001 "Dependency confusion or typosquatting through the package's dependencies; code run at every Python start (.pth)" \
+  "no dependencies at all; no .pth file that runs code" "$(verdict "$([ -z "${deps// /}" ] && [ -z "${pth// /}" ] && echo 1)")" \
+  "other packages in its environment: ${deps:-none}; .pth files that run code: ${pth:-none} (all .pth: ${allpth:-none}, path entries only); wheel attacked: sha256 $wsha..."
+ww=$(T 'find /opt/pipx/venvs/host-guard /usr/local/bin/host-guard /opt/host-guard \( -perm -o+w ! -type l \) -o \( ! -user root \) 2>/dev/null | head -5 | tr "\n" " "')
+record PKG-4 T1574.010 "A non-root user rewrites the package, the host-guard command or a release (all run as root)" \
+  "every file owned by root, none writable by others" "$(verdict "$([ -z "${ww// /}" ] && echo 1)")" "writable or not root's: ${ww:-none}"
+out=$(T 'host-guard status 2>&1 | head -3 | tr "\n" " "')
+record PKG-5 T1195.002 "After the attacks: the install is still the one from the tested wheel" "status unchanged, upgrade works again" \
+  "$(verdict "$(T 'host-guard upgrade --yes >/dev/null 2>&1' && echo 1)")" "${out:0:160}"
 
 echo "==> Mails the admins received"
 T 'cat /var/mail/hg-captured' > "$OUT/mails.txt"

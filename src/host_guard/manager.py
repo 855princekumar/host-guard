@@ -178,6 +178,49 @@ def find_payload():
     raise Fail('cannot find the host-guard files next to this program')
 
 
+def verify_payload(payload):
+    """The files a pip install brought must still be exactly what the package's RECORD lists
+    (SHA-256 of each): a payload changed after install (by anyone who could write the
+    site-packages folder) is refused before anything of it runs as root. A git checkout or
+    the copy in /opt/host-guard has no RECORD and is not checked here. Returns the number of
+    files checked."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if os.path.realpath(payload) != os.path.realpath(os.path.join(here, 'payload')):
+        return 0
+    try:
+        from importlib import metadata
+        dist = metadata.distribution('host-guard')
+        files = dist.files or []
+    except Exception:
+        return 0
+    import base64
+    want = {}
+    for f in files:
+        parts = str(f).replace('\\', '/').split('/')
+        if parts[:2] == ['host_guard', 'payload'] and f.hash and f.hash.mode == 'sha256':
+            want[os.path.realpath(f.locate())] = f.hash.value
+    if not want:
+        return 0
+    bad = []
+    for path_, value in sorted(want.items()):
+        try:
+            with open(path_, 'rb') as fh:
+                got = base64.urlsafe_b64encode(hashlib.sha256(fh.read()).digest()).rstrip(b'=').decode()
+        except OSError:
+            bad.append(f'missing: {path_}')
+            continue
+        if got != value:
+            bad.append(f'changed: {path_}')
+    for d, dirs, names in os.walk(payload):
+        dirs[:] = [x for x in dirs if x != '__pycache__']
+        bad += [f'added: {os.path.join(d, n)}' for n in names if os.path.realpath(os.path.join(d, n)) not in want]
+    if bad:
+        raise Fail('the installed host-guard package was changed after it was installed, so nothing of it runs:\n  '
+                   + '\n  '.join(bad[:20]) + '\nReinstall it from PyPI:  sudo PIPX_HOME=/opt/pipx PIPX_BIN_DIR=/usr/local/bin '
+                   'pipx install --force host-guard')
+    return len(want)
+
+
 # ---------------------------------------------------------------- state and history
 def load_state():
     try:
@@ -647,6 +690,9 @@ def install_manager_copy(version):
 def cmd_install(argv, upgrade=False):
     mine, given = parse_args(argv)
     payload = find_payload()
+    checked = verify_payload(payload)
+    if checked:
+        say(f'package files intact: {checked} files match the package\'s SHA-256 record')
     new = read_version(payload)
     with Lock():
         st = load_state()
