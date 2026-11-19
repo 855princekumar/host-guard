@@ -22,7 +22,7 @@ For anyone running a product on a single cloud instance, VPS or bare-metal box w
 
 [![Bandit](https://img.shields.io/badge/security%20lint-Bandit-yellow)](.github/workflows/ci.yml)
 [![gitleaks](https://img.shields.io/badge/secret%20scan-gitleaks-blueviolet)](.github/workflows/ci.yml)
-[![Red team](https://img.shields.io/badge/red%20team-52%20attacks%20stopped%2C%203%20gaps%20open-c0392b)](docs/REDTEAM.md)
+[![Red team](https://img.shields.io/badge/red%20team-53%20attacks%20stopped%2C%203%20gaps%20open-c0392b)](docs/REDTEAM.md)
 [![Rollback](https://img.shields.io/badge/install-manifest%20%2B%20rollback-success)](docs/VERSIONS.md)
 [![No agent](https://img.shields.io/badge/agent-none-lightgrey)](#why-host-guard)
 
@@ -64,10 +64,10 @@ security updates.
 
 ## Proven by attack
 
-Every change is attacked in CI before it can merge: 55 real attacks on an isolated
+Every change is attacked in CI before it can merge: 56 real attacks on an isolated
 network against a server installed by the version manager, plus the dashboard attacked
 from a real browser, each mapped to MITRE ATT&CK.
-**52 stopped or detected, 3 known gaps, 0 failed.** The suite lives in
+**53 stopped or detected, 3 known gaps, 0 failed.** The suite lives in
 [ci/redteam/](ci/redteam/) and runs as the `Red team` job, required for every merge and release.
 
 | Phase | Attacks | Result |
@@ -79,7 +79,7 @@ from a real browser, each mapped to MITRE ATT&CK.
 | Backups: theft, tampering of the off-site copy, restore | 4 | 4 stopped |
 | Secrets: leaks, file permissions, panel account | 3 | 3 stopped |
 | Dashboard in a real browser: sign-in with the mailed code, screenshots | 2 | 2 stopped |
-| Dashboard attacks: DNS rebinding, CSRF, CORS, framing, stored XSS, SQL injection, session fixation and theft, code replay and guessing, address enumeration, code flooding, a taken-over panel abusing the root mailer, methods, path traversal | 21 | 20 stopped, 1 gap |
+| Dashboard attacks: DNS rebinding, CSRF, CORS, framing, stored XSS, SQL injection, session fixation and theft, code replay and guessing, address enumeration, code flooding, a taken-over panel abusing the root mailer or swapping its outbox for a link, methods, path traversal | 22 | 21 stopped, 1 gap |
 | The pip package: tampered or planted files, dependencies, startup code, write access | 5 | 5 stopped |
 
 Known gaps, reported rather than hidden: a miner renamed like a kernel thread, run from /usr/local/bin; a port scan of 20 common ports; stolen session cookie replayed from another browser.
@@ -236,7 +236,7 @@ python ci/build_dist.py && docker run --rm -v "$PWD:/src:ro" -v "$PWD/dist:/dist
 | Install, upgrade, rollback, uninstall (same three) | the pip package through its whole life; after `uninstall --purge` the server is byte-for-byte as before |
 | Database backups and restore tests | real MariaDB and PostgreSQL, restored into throwaway databases |
 | Package | sdist and wheel carry what runs on a server; `twine check`; VERSION matches the changelog |
-| Red team | 55 real attacks on an isolated network, scored per MITRE ATT&CK; a failed defense fails CI |
+| Red team | 56 real attacks on an isolated network, scored per MITRE ATT&CK; a failed defense fails CI |
 | Clouds | AWS, Google Cloud, Azure, Oracle Cloud and bare metal detected; backups off-site to emulated stores and restore-tested; forged signatures refused |
 | CodeQL (Python, Actions) | security-extended queries on every change and weekly |
 | Lint, Bandit, gitleaks, ShellCheck, systemd units | code quality, security patterns, no secret in the whole history, unit files valid |
