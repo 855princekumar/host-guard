@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """The panel in a real browser (headless Chromium, Playwright), as an admin sees it through an
 SSH tunnel: the container shares the target's network namespace, so 127.0.0.1:8650 is the
-panel. Signs in, takes the screenshots for the docs, then attacks it the way a hostile web page
+panel. Signs in with the admin's address and the code mailed to it (read from the admins'
+mailbox, mounted at /mail), takes the screenshots for the docs, then attacks it the way a hostile web page
 open in the same browser would: reading it across origins (CORS), posting to it from another
 site, framing it, and stored script injection through the status data. A page on evil.test
 (served here on port 9999) plays the hostile site. Prints one JSON object per check."""
-import base64
-import hashlib
-import hmac
 import http.server
 import json
 import os
-import struct
+import re
 import threading
 import time
 
@@ -19,7 +17,7 @@ from playwright.sync_api import sync_playwright
 
 PANEL = 'http://127.0.0.1:8650'
 EVIL = 'http://evil.test:9999'
-USER, PASSWORD, SECRET = 'admin', 'Panel-Pass-2026!', 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP'
+ADMIN, MAILBOX = 'security@example.com', '/mail/hg-captured'
 OUT = os.environ.get('OUT', '/out')
 PAGES = {
     'read.html': f"""<script>
@@ -38,10 +36,23 @@ def check(id_, technique, attack, expected, ok, evidence, gap=False):
                 'result': 'PASS' if ok else ('GAP' if gap else 'FAIL'), 'evidence': evidence})
 
 
-def totp(step):
-    mac = hmac.new(base64.b32decode(SECRET), struct.pack('>Q', step), hashlib.sha1).digest()
-    off = mac[-1] & 0x0F
-    return str((struct.unpack('>I', mac[off:off + 4])[0] & 0x7FFFFFFF) % 10 ** 6).zfill(6)
+def mailbox():
+    try:
+        return open(MAILBOX, encoding='utf-8', errors='replace').read()
+    except OSError:
+        return ''
+
+
+def code_after(before, timeout=25):
+    """The code mailed to the admin since the mailbox had `before` characters (the admin's inbox)."""
+    end = time.time() + timeout
+    while time.time() < end:
+        for part in reversed(mailbox()[before:].split('=== MAIL to ')[1:]):
+            m = re.search(r'Code: (\d{6})', part)
+            if part.split('\n', 1)[0].strip() == ADMIN and m:
+                return m.group(1)
+        time.sleep(0.5)
+    return ''
 
 
 class Evil(http.server.BaseHTTPRequestHandler):
@@ -68,24 +79,29 @@ with sync_playwright() as p:
 
     page.goto(PANEL + '/login')
     page.screenshot(path=f'{OUT}/panel-signin.png')
-    check('GUI-1', 'T1078', 'The sign-in page in a browser', 'name, password and authenticator code; nothing else',
-          page.locator('#u').count() == 1 and page.locator('#c').count() == 1 and 'Sign out' not in page.content(),
-          'sign-in form shown; screenshot panel-signin.png')
+    check('GUI-1', 'T1078', 'The sign-in page in a browser', 'only an email address: no password field',
+          page.locator('#e').count() == 1 and page.locator('input[type=password]').count() == 0
+          and 'Sign out' not in page.content(), 'email form shown; screenshot panel-signin.png')
 
     ctx.add_cookies([{'name': 'hg_s', 'value': 'attacker-chosen-session-id', 'url': PANEL}])
     page.goto(PANEL + '/login')
-    page.fill('#u', USER)
-    page.fill('#p', PASSWORD)
-    page.fill('#c', totp(int(time.time() // 30)))
+    before = len(mailbox())
+    page.fill('#e', ADMIN)
+    page.click('button')
+    page.wait_for_selector('#c')
+    page.screenshot(path=f'{OUT}/panel-signin-code.png')
+    code = code_after(before)
+    page.fill('#c', code)
     page.click('button')
     page.wait_for_load_state()
     html = page.content()
     session = next((c['value'] for c in ctx.cookies() if c['name'] == 'hg_s'), '')
     signed_in = 'Sign out' in html and all(s in html for s in ('Open problems', 'Health', 'Backup'))
     page.screenshot(path=f'{OUT}/panel-dashboard.png', full_page=True)
-    check('GUI-2', 'T1078', 'An admin signs in with password and authenticator code in a real browser',
-          'the dashboard: open problems, health, backup and the rest', signed_in,
-          f'signed in: {signed_in}; screenshot panel-dashboard.png')
+    check('GUI-2', 'T1078', 'An admin signs in with their address and the code mailed to it, in a real browser',
+          'the dashboard: open problems, health, backup and the rest', signed_in and ADMIN in html,
+          f'code read from the mailbox: {bool(code)}; signed in: {signed_in}; screenshots panel-signin-code.png, '
+          'panel-dashboard.png')
     check('PANEL-11', 'T1563', 'Session fixation: a session cookie planted before sign-in',
           'replaced by a new random session at sign-in', bool(session) and session != 'attacker-chosen-session-id',
           f'cookie after sign-in is {"a new value" if session != "attacker-chosen-session-id" else "the planted one"}')

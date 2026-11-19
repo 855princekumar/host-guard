@@ -57,7 +57,7 @@ host-guard install --mail-to security@example.com --profile examples/profiles/pl
   --login-user ops --web-logs /var/log/nginx --smtp-plain --smtp-host 127.0.0.1 --smtp-port 1025 \
   --s3-bucket hg-backups --s3-endpoint http://floci:4566 --region us-east-1 --with-panel --yes
 
-printf 'NOTIFY_CMD=/usr/local/bin/capture-mail\nSITE=redteam-target\n' >> /etc/host-guard/guard.conf
+printf 'NOTIFY_CMD=/usr/local/bin/capture-mail\nSITE=redteam-target\nPANEL_ADMINS=security@example.com,admin2@example.com\n' >> /etc/host-guard/guard.conf
 sed -i 's/^AWS_ACCESS_KEY_ID=$/AWS_ACCESS_KEY_ID=test/; s/^AWS_SECRET_ACCESS_KEY=$/AWS_SECRET_ACCESS_KEY=rt-secret-7f3a9c51e2/' /etc/host-guard/.env
 
 cat > /etc/fail2ban/jail.d/zz-container.local <<'EOF'
@@ -72,18 +72,11 @@ fail2ban-client -x start >/dev/null
 for _ in $(seq 30); do fail2ban-client ping >/dev/null 2>&1 && break; sleep 1; done
 
 runuser -u hgpanel -- python3 -I /usr/local/lib/host-guard-panel/hgpanel.py serve > /var/log/hgpanel.log 2>&1 &
-python3 - <<'EOF'
-# The panel's one admin, with a known password and authenticator secret (test values)
-import importlib.util, os, time
-spec = importlib.util.spec_from_file_location('hgpanel', '/usr/local/lib/host-guard-panel/hgpanel.py')
-p = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(p)
-con = p.db()
-con.execute('DELETE FROM admin')
-con.execute('INSERT INTO admin (id, username, pw_hash, totp_secret, created) VALUES (1, ?, ?, ?, ?)',
-            ('admin', p.hash_password('Panel-Pass-2026!'), 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP', time.time()))
-os.system('chown hgpanel:hgpanel /var/lib/host-guard-panel/panel.db*')
-EOF
+# What host-guard-panel-mail.path does on a real server: mail the panel's sign-in codes as soon
+# as the panel leaves one in its outbox (the admin, security@example.com, reads them from the
+# captured mailbox, /var/mail/hg-captured, exactly as from an inbox)
+(while true; do [ -n "$(ls -A /var/lib/host-guard-panel/outbox 2>/dev/null)" ] && hostguard panel-outbox >/dev/null 2>&1
+  sleep 1; done) &
 for _ in $(seq 20); do curl -s -o /dev/null http://127.0.0.1:8650/login && break; sleep 0.5; done
 
 hostguard watch >/dev/null      # baselines: files, accounts, keys

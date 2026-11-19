@@ -31,6 +31,7 @@ Start from a profile in [examples/profiles/](../examples/profiles/) and change w
 |---|---|---|
 | `MAIL_TO` | (installer) | every admin, separated by commas or spaces; anything that is not a plain address is skipped |
 | `MAIL_FROM` | first of `MAIL_TO` | the sending account |
+| `PANEL_ADMINS` | `MAIL_TO` | the addresses that may sign in to the dashboard; a sign-in code is mailed only to them ([panel](PANEL.md#sign-in)) |
 | `SITE` | host name | the server's name in every subject |
 | `COOLDOWN_H` | `6` | the same open problem is mailed at most this often |
 | `NOTIFY_CMD` | `msmtp -a default` | the command that sends a mail (the message on stdin, recipients as arguments) |
