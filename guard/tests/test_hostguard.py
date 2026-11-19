@@ -5,6 +5,7 @@ first run, replication is read right, and the daily report has every part."""
 import importlib.util
 import json
 import os
+import stat
 import sys
 import time
 
@@ -752,7 +753,7 @@ def test_an_outbox_others_can_open_or_of_another_user_is_not_read(hg, tmp_path):
     box = str(tmp_path / 'outbox')
     t = time.time()
     drop(box, f'{int(t * 1000)}-{"d" * 16}.json', {'kind': 'code', 'email': 'a@example.com', 'code': '123456', 'at': t})
-    os.chmod(box, 0o710)                                     # any group or other bit refuses it
+    os.chmod(box, os.stat(box).st_mode | stat.S_IXGRP)       # one group bit (search) is enough to refuse it
     hg.C.update({'PANEL_OUTBOX': box, 'PANEL_USER': me(), 'MAIL_TO': 'a@example.com'})
     hg.panel_outbox()
     assert not sent_to(hg) and len(os.listdir(box)) == 1
