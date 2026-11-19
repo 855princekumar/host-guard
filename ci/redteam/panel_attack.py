@@ -174,7 +174,8 @@ check('PANEL-8', 'T1550.004', 'Reuse of a session cookie after sign-out', 'sessi
 
 p2, csrf = form_token()
 st, tok, _, _ = send_code(ADMIN, code, f'hg_pre={p2}; ' + LAST['cookies'].split('; ', 1)[1], csrf)   # the same browser
-check('PANEL-9', 'T1111', 'Replay of a sign-in code already used, from the browser that used it', 'refused (single use)', not tok and st == 401, f'HTTP {st}')
+check('PANEL-9', 'T1111', 'Replay of a sign-in code already used, from the browser that used it', 'refused (single use)',
+      not tok and st == 401, f'HTTP {st}')
 
 codes, cors = {}, []
 for m_ in ('PUT', 'DELETE', 'PATCH', 'TRACE', 'OPTIONS'):
