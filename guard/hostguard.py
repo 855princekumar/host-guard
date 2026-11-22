@@ -45,6 +45,7 @@ import glob
 import gzip
 import hashlib
 import hmac
+import html
 import io
 import ipaddress
 import json
@@ -57,6 +58,7 @@ import ssl
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -89,6 +91,17 @@ DEFAULTS = {
     'USN_URL': 'https://ubuntu.com/security/notices.json?limit=30',
     'OSV_URL': 'https://api.osv.dev/v1/querybatch', 'OSV_VULN_URL': 'https://api.osv.dev/v1/vulns/',
     'CONTAINERS_PYTHON': '',
+    # advisories (shield): official machine-readable sources decide; research labs, news and the
+    # admins' own sources are context only and never start a fix (docs/ADVISORIES.md)
+    'NVD_URL': 'https://services.nvd.nist.gov/rest/json/cves/2.0', 'EPSS_URL': 'https://api.first.org/data/v1/epss',
+    'EOL_URL': 'https://endoflife.date/api/',
+    'AUTO_FIX': 'off',              # off | critical: fix Critical findings by themselves, after the hold
+    'AUTO_FIX_HOLD_H': '24',        # hours the admins have to hold a Critical fix before it runs
+    'FIX_WINDOW': '',               # e.g. "Sun 03:30-05:00"; empty: any time after the hold
+    'READER': '',                   # a reader for context web pages, e.g. https://r.jina.ai/ (pages come back
+                                    # as Markdown); empty: pages are read directly. Never used for official sources.
+    'SOURCES_MAX': '20',            # sources the admins may add
+    'SHIELD_PATH': '/usr/local/lib/host-guard/shield.py',
     # the panel's sign-in: who may get a code (empty: every MAIL_TO address), where the panel
     # leaves its requests, and the panel's own user (only its files are read)
     'PANEL_ADMINS': '', 'PANEL_OUTBOX': '/var/lib/host-guard-panel/outbox', 'PANEL_USER': 'hgpanel',
@@ -100,7 +113,7 @@ DEFAULTS = {
     'PRICE_S3_GB_MONTH': '0.025',
 }
 SECRETS = ('SMTP_PASSWORD', 'BACKUP_PASSPHRASE', 'EDGESHELL_KEY', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY',
-           'BACKUP_REMOTE_URL')
+           'BACKUP_REMOTE_URL', 'NVD_API_KEY', 'READER_KEY')
 REGIONS = {'ap-south-1': 'Asia Pacific (Mumbai)', 'ap-south-2': 'Asia Pacific (Hyderabad)',
            'ap-southeast-1': 'Asia Pacific (Singapore)', 'us-east-1': 'US East (N. Virginia)',
            'us-west-2': 'US West (Oregon)', 'eu-west-1': 'EU (Ireland)', 'eu-central-1': 'EU (Frankfurt)'}
@@ -855,18 +868,85 @@ def unlock():
 
 
 # ---------------------------------------------------------------- feeds (every 6 h)
-def get_json(url, data=None, timeout=60):
+def public_connection(address, *args, **kw):
+    """socket.create_connection that keeps the socket only when its peer is a public address:
+    checked on the connection actually made, before a byte is sent (no TLS hello either), so a
+    name that resolves elsewhere between a check and the read does not help."""
+    sock = socket.create_connection(address, *args, **kw)
+    ip = ipaddress.ip_address(sock.getpeername()[0].split('%')[0])
+    if not ip.is_global or ip.is_multicast:
+        sock.close()
+        raise urllib.error.URLError(f'{address[0]} is at {ip}, not a public address: refused')
+    return sock
+
+
+class _PublicHTTPS(urllib.request.HTTPSHandler):
+    """Opens https connections only to public addresses (public_connection)."""
+
+    def https_open(self, req):
+        import http.client
+
+        class Conn(http.client.HTTPSConnection):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self._create_connection = public_connection
+        return self.do_open(Conn, req, context=ssl.create_default_context())
+
+
+class _PublicRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, hdrs, newurl):
+        if not newurl.startswith('https://'):
+            raise urllib.error.URLError(f'redirect to {newurl[:80]} refused (https only)')
+        return super().redirect_request(req, fp, code, msg, hdrs, newurl)
+
+
+def fetch(url, data=None, timeout=60, headers=None, accept='application/json', limit=None, public_only=False):
+    """The body of an https (or test http) URL, at most `limit` bytes, gunzipped. public_only:
+    https to public addresses only, through every redirect (for addresses the admins chose)."""
+    limit = limit or FEED_MAX
+    if not url.startswith(('https://',) if public_only else ('https://', 'http://')):
+        raise ValueError(f'not an allowed web address: {url[:80]}')
     req = urllib.request.Request(url, data=json.dumps(data).encode() if data is not None else None,
-                                 headers={'User-Agent': 'host-guard', 'Accept': 'application/json',
-                                          'Accept-Encoding': 'gzip',
-                                          **({'Content-Type': 'application/json'} if data is not None else {})})
-    with urllib.request.urlopen(req, timeout=timeout) as r:  # nosec B310
-        body = r.read(FEED_MAX + 1)
+                                 headers={'User-Agent': 'host-guard', 'Accept': accept, 'Accept-Encoding': 'gzip',
+                                          **({'Content-Type': 'application/json'} if data is not None else {}),
+                                          **(headers or {})})
+    open_ = (urllib.request.build_opener(_PublicHTTPS(), _PublicRedirect()).open if public_only
+             else urllib.request.urlopen)
+    with open_(req, timeout=timeout) as r:  # nosec B310 (scheme checked above)
+        body = r.read(limit + 1)
     if body[:2] == b'\x1f\x8b':                 # AWS's price files come gzip-compressed, asked for or not
-        body = gzip.GzipFile(fileobj=io.BytesIO(body)).read(FEED_MAX + 1)
-    if len(body) > FEED_MAX:
-        raise ValueError(f'answer larger than {FEED_MAX // (1024 * 1024)} MiB')
-    return json.loads(body.decode('utf-8', 'replace'))
+        body = gzip.GzipFile(fileobj=io.BytesIO(body)).read(limit + 1)
+    if len(body) > limit:
+        raise ValueError(f'answer larger than {limit // (1024 * 1024)} MiB')
+    return body
+
+
+def get_json(url, data=None, timeout=60, headers=None):
+    return json.loads(fetch(url, data, timeout, headers).decode('utf-8', 'replace'))
+
+
+def get_text(url, timeout=60, headers=None, public_only=False):
+    return fetch(url, None, timeout, headers, accept='text/html, application/rss+xml, application/xml, text/*',
+                 limit=TEXT_MAX, public_only=public_only).decode('utf-8', 'replace')
+
+
+def read_page(url, public_only=False):
+    """A context web page as text. Through READER (e.g. https://r.jina.ai/, which returns the
+    page as Markdown) when set, else directly with the HTML tags taken out. Only ever for
+    context: what a reader returns could be changed on the way, so it never decides a fix."""
+    if C['READER']:
+        try:
+            return get_text(C['READER'].rstrip('/') + '/' + url, timeout=90, public_only=public_only,
+                            headers={'Authorization': f'Bearer {C["READER_KEY"]}'} if C['READER_KEY'] else None)
+        except Exception as e:                      # the reader down or over its limit: read it directly
+            print(f'reader failed for {url[:80]} ({str(e)[:80]}); reading it directly')
+    html_ = get_text(url, public_only=public_only)
+    html_ = re.sub(r'(?is)<(script|style|noscript)\b.*?</\1>', ' ', html_)
+    html_ = re.sub(r'(?i)<br\s*/?>|</(p|div|li|h[1-6]|tr|article|section)>', '\n', html_)
+    return html.unescape(re.sub(r'<[^>]+>', ' ', html_))
+
+
+TEXT_MAX = 20 * 1024 * 1024
 
 
 FEED_MAX = 200 * 1024 * 1024           # the CISA list is about 1.5 MB, AWS's biggest price file about 30 MB
@@ -1891,6 +1971,20 @@ def scrub(value, secret_values):
     return value
 
 
+def export_sources():
+    """The advisory sources for the panel's Sources page: what each is, and whether it reads."""
+    try:
+        st = load('shield.json')
+        read = st.get('sources', {})
+        return [{'id': x['id'], 'name': x['name'], 'url': x['url'], 'kind': x['kind'], 'fmt': x.get('fmt', ''),
+                 'added': bool(x.get('added')), 'by': x.get('by', ''), 'ok_at': read.get(x['id'], {}).get('ok_at'),
+                 'failing': bool(read.get(x['id'], {}).get('fail')), 'error': read.get(x['id'], {}).get('error', '')}
+                for x in shield_module().all_sources(st)]
+    except Exception as e:                                   # never let the advisories stop the export
+        print(f'export: sources not listed ({e})')
+        return []
+
+
 def export():
     """Write what the panel shows (no secrets) to EXPORT_FILE, readable by the panel's group.
     The panel runs unprivileged and never reads host-guard's own state or .env."""
@@ -1900,7 +1994,7 @@ def export():
             **{k: s.get(k) for k in STATUS_KEYS},
             'open_problems': [{'key': k, 'subject': v.get('subject', ''), 'at': v.get('at')}
                               for k, v in sorted(load('alerts.json').items())],
-            'mails': load('mail-log.json').get('sent', [])[-30:]}
+            'mails': load('mail-log.json').get('sent', [])[-30:], 'sources': export_sources()}
     data = scrub(json.loads(json.dumps(data, default=str)), [C[k] for k in SECRETS if len(C[k]) >= 6])
     os.makedirs(os.path.dirname(target), exist_ok=True)
     tmp = target + '.tmp'
@@ -1988,7 +2082,9 @@ def _panel_outbox(dfd, uid):
     s = load('panel-mail.json')
     sent = [x for x in s.get('sent', []) if x.get('at', 0) > now() - 3600]
     told = [x for x in s.get('notices', []) if x.get('at', 0) > now() - 3600]
+    changes = [x for x in s.get('changes', []) if x.get('at', 0) > now() - 3600]
     done = refused = 0
+    exported = False
     for n in names:
         data = None
         if OUTBOX_NAME.match(n):
@@ -2027,12 +2123,20 @@ def _panel_outbox(dfd, uid):
                 refused += 1
                 print(f'panel-outbox: code for {email} not sent (limit reached)')
                 continue
-            mail(subject='Your dashboard sign-in code', category='Sign-in', level='info', to=[email], body=
-                 f'Code: {data["code"]}\n\nIt works once, for 10 minutes, on the host-guard dashboard of {C["SITE"]}, '
-                 'in the browser that asked for it.\n\n'
-                 'Did you not ask for it? Someone who can reach the dashboard (it is only reachable through a '
-                 'tunnel to this server) entered your address. Nothing happens without the code. Tell the other '
-                 'admins, and look at the audit log: sudo -u hgpanel python3 /usr/local/lib/host-guard-panel/hgpanel.py audit')
+            if data.get('purpose') == 'confirm':
+                what = re.sub(r'[\x00-\x1f\x7f]', ' ', str(data.get('summary', '')))[:300]
+                mail(subject='Your code to confirm a dashboard change', category='Sign-in', level='info', to=[email], body=
+                     f'Code: {data["code"]}\n\nIt confirms this change on the host-guard dashboard of {C["SITE"]}:\n\n'
+                     f'  {what}\n\nIt works once, for 10 minutes, in the session that asked for it.\n\n'
+                     'Not you? Someone is signed in as you: do not give anyone this code, sign out everywhere '
+                     '(sudo -u hgpanel python3 /usr/local/lib/host-guard-panel/hgpanel.py logout-all) and tell the other admins.')
+            else:
+                mail(subject='Your dashboard sign-in code', category='Sign-in', level='info', to=[email], body=
+                     f'Code: {data["code"]}\n\nIt works once, for 10 minutes, on the host-guard dashboard of {C["SITE"]}, '
+                     'in the browser that asked for it.\n\n'
+                     'Did you not ask for it? Someone who can reach the dashboard (it is only reachable through a '
+                     'tunnel to this server) entered your address. Nothing happens without the code. Tell the other '
+                     'admins, and look at the audit log: sudo -u hgpanel python3 /usr/local/lib/host-guard-panel/hgpanel.py audit')
             sent.append({'at': now(), 'email': email})
             done += 1
         elif kind == 'signed-in':
@@ -2046,9 +2150,36 @@ def _panel_outbox(dfd, uid):
                  'sudo -u hgpanel python3 /usr/local/lib/host-guard-panel/hgpanel.py audit')
             told.append({'at': now(), 'email': email})
             done += 1
+        elif kind in ('source-add', 'source-remove'):
+            # an admin confirmed it with a mailed code on the dashboard; a taken-over panel could
+            # skip that, so root still decides: context sources only, public https only, at most
+            # SOURCES_MAX, 10 changes an hour, every change mailed to every admin
+            if len(changes) >= 10:
+                refused += 1
+                print(f'panel-outbox: source change by {email} not made (10 an hour)')
+                continue
+            changes.append({'at': now(), 'email': email})
+            sh = shield_module()
+            st = load('shield.json')
+            by = f'{email} (on the dashboard)'
+            if kind == 'source-add':
+                ok, msg = sh.add_source(this(), st, data.get('name', ''), data.get('url', ''),
+                                        data.get('fmt', 'feed'), by=by)
+            else:
+                ok, msg = sh.remove_source(this(), st, str(data.get('id', '')), by=by)
+            if not ok:
+                mail(subject='Dashboard change not made', category='Advisory', level='info', to=[email],
+                     body=f'Your change was not made: {msg}')
+            done += 1
+            exported = True
         else:
             refused += 1
-    s['sent'], s['notices'] = sent, told
+    if exported:
+        try:
+            export()                                         # the dashboard shows the new list at once
+        except Exception as e:
+            print(f'panel-outbox: export failed: {e}')
+    s['sent'], s['notices'], s['changes'] = sent, told, changes
     save(s, 'panel-mail.json')
     print(f'panel-outbox: {done} mailed, {refused} refused')
 
@@ -2062,11 +2193,32 @@ def test_mail():
 COMMANDS = {'health': health, 'cost': cost, 'watch': watch, 'feeds': feeds, 'scan': scan, 'backup': backup,
             'restore-test': restore_test, 'patch-window': patch_window, 'boot': boot, 'report': report,
             'status': status, 'test-mail': test_mail, 'unlock': unlock, 'export': export, 'whereami': whereami,
-            'panel-outbox': lambda: panel_outbox()}
+            'panel-outbox': lambda: panel_outbox(), 'shield': lambda: shield_module().run(this())}
+SHIELD_CLI = ('inventory', 'findings', 'hold', 'ignore', 'fix', 'undo', 'sources')
+
+
+def this():
+    """This module, as shield.py gets it (also when loaded by a test, not imported)."""
+    import types
+    return sys.modules.get(__name__) or types.SimpleNamespace(**globals())
+
+
+def shield_module():
+    """guard/shield.py, installed next to this file's libraries (loaded only when used)."""
+    import importlib.util
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'shield.py')
+    path_ = here if os.path.exists(here) else C['SHIELD_PATH']
+    spec = importlib.util.spec_from_file_location('hostguard_shield', path_)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
 
 if __name__ == '__main__':
     if len(sys.argv) == 2 and sys.argv[1] in COMMANDS or sys.argv[1:] == ['whereami', '--short']:
         COMMANDS[sys.argv[1]]()
+    elif len(sys.argv) >= 2 and sys.argv[1] in SHIELD_CLI:
+        sys.exit(shield_module().cli(this(), sys.argv[1:]))
     else:
         print(__doc__)
         sys.exit(2)

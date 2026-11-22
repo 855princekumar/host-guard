@@ -4,6 +4,7 @@ Python 3 standard library and one SQLite file, nothing else.
 
     hgpanel serve                       run the panel (systemd runs it as the user hgpanel)
     hgpanel audit [N]                   the last N audit lines (code requests, sign-ins, failures)
+    hgpanel logout-all                  end every session (everyone signs in again with a new code)
 
 Sign-in: no password. An admin enters their email address; a 6-digit code goes to that
 address, and only that address. It works once, for 10 minutes. The admins are the
@@ -93,6 +94,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   token_hash TEXT PRIMARY KEY, csrf TEXT NOT NULL, created REAL NOT NULL, seen REAL NOT NULL, ip TEXT NOT NULL,
   email TEXT NOT NULL DEFAULT '');
 CREATE TABLE IF NOT EXISTS failures (ip TEXT NOT NULL, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS changes (sess TEXT PRIMARY KEY, data TEXT NOT NULL, created REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (at REAL NOT NULL, ip TEXT NOT NULL, event TEXT NOT NULL, detail TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS failures_ip ON failures (ip, at);
 CREATE INDEX IF NOT EXISTS requests_email ON requests (email, at);
@@ -153,7 +155,7 @@ def norm(email):
     return e if EMAIL.match(e) else ''
 
 
-def request_code(con, ip, email, owner):
+def request_code(con, ip, email, owner, purpose='sign-in', summary=''):
     """Make a code for this address and hand it to the mailer. Returns the message shown,
     the same for every address (the panel does not know who the admins are).
 
@@ -179,8 +181,8 @@ def request_code(con, ip, email, owner):
         con.execute('INSERT OR REPLACE INTO codes (email, owner, salt, code_hash, created, tries) VALUES (?, ?, ?, ?, ?, 0)',
                     (e, owner, salt, sha(salt + code), t))
         con.execute('INSERT INTO requests (email, owner, at) VALUES (?, ?, ?)', (e, owner, t))
-        audit(con, ip, 'code requested', e)
-    outbox('code', e, code=code, ip=ip)
+        audit(con, ip, 'code requested' if purpose == 'sign-in' else 'change code requested', e)
+    outbox('code', e, code=code, ip=ip, purpose=purpose, summary=summary[:300])
     return True, msg
 
 
@@ -191,40 +193,100 @@ def ip_blocked(con, ip):
     return n >= int(C['IP_LIMIT'])
 
 
+def check_code(con, ip, e, code, owner):
+    """(True, '') when `code` is the live code of (e, owner), which it uses up; else (False,
+    message) and the try counts against the code. Call with _lock held."""
+    code = (code or '').strip()
+    blocked = ip_blocked(con, ip)
+    row = con.execute('SELECT salt, code_hash, created, tries FROM codes WHERE email = ? AND owner = ?',
+                      (e, owner)).fetchone() if e and owner else None
+    fresh = bool(row) and time.time() - row[2] <= float(C['CODE_MIN']) * 60 and row[3] < int(C['CODE_TRIES'])
+    good = fresh and CODE_RE.fullmatch(code) is not None and hmac.compare_digest(sha(row[0] + code), row[1])
+    if not good:
+        # every wrong try counts against the code, blocked or not: CODE_TRIES and it is gone
+        con.execute('INSERT INTO failures (ip, at) VALUES (?, ?)', (ip, time.time()))
+        if row:
+            if fresh and row[3] + 1 < int(C['CODE_TRIES']):
+                con.execute('UPDATE codes SET tries = tries + 1 WHERE email = ? AND owner = ?', (e, owner))
+            else:
+                con.execute('DELETE FROM codes WHERE email = ? AND owner = ?', (e, owner))     # burned
+                audit(con, ip, 'code burned', e)
+        if blocked:
+            # Every visitor arrives as 127.0.0.1 through the tunnel, so this counter is shared:
+            # it slows guessing, but the right code always gets in.
+            audit(con, ip, 'blocked', 'too many failures from this address')
+            return False, 'Too many failed sign-ins. Try again later.'
+        audit(con, ip, 'code failed', e or '(no address)')
+        return False, 'That code is not valid. Ask for a new one.'
+    con.execute('DELETE FROM codes WHERE email = ? AND owner = ?', (e, owner))       # single use
+    return True, ''
+
+
 def sign_in(con, ip, email, code, owner):
     """Returns (session token or None, message). The code is single use: it is deleted on
     success, and burned after CODE_TRIES wrong tries or CODE_MIN minutes. Only the browser
     that asked for it (`owner`) can use it."""
-    generic = 'That code is not valid. Ask for a new one.'
     e = norm(email)
-    code = (code or '').strip()
     with _lock:
-        blocked = ip_blocked(con, ip)
-        row = con.execute('SELECT salt, code_hash, created, tries FROM codes WHERE email = ? AND owner = ?',
-                          (e, owner)).fetchone() if e and owner else None
-        fresh = bool(row) and time.time() - row[2] <= float(C['CODE_MIN']) * 60 and row[3] < int(C['CODE_TRIES'])
-        good = fresh and CODE_RE.fullmatch(code) is not None and hmac.compare_digest(sha(row[0] + code), row[1])
-        if not good:
-            # every wrong try counts against the code, blocked or not: CODE_TRIES and it is gone
-            con.execute('INSERT INTO failures (ip, at) VALUES (?, ?)', (ip, time.time()))
-            if row:
-                if fresh and row[3] + 1 < int(C['CODE_TRIES']):
-                    con.execute('UPDATE codes SET tries = tries + 1 WHERE email = ? AND owner = ?', (e, owner))
-                else:
-                    con.execute('DELETE FROM codes WHERE email = ? AND owner = ?', (e, owner))     # burned
-                    audit(con, ip, 'code burned', e)
-            if blocked:
-                # Every visitor arrives as 127.0.0.1 through the tunnel, so this counter is shared:
-                # it slows guessing, but the right code always gets in.
-                audit(con, ip, 'blocked', 'too many failures from this address')
-                return None, 'Too many failed sign-ins. Try again later.'
-            audit(con, ip, 'sign-in failed', e or '(no address)')
-            return None, generic
-        con.execute('DELETE FROM codes WHERE email = ? AND owner = ?', (e, owner))       # single use
+        ok, msg = check_code(con, ip, e, code, owner)
+        if not ok:
+            return None, msg
         audit(con, ip, 'sign-in', e)
         token = new_session(con, ip, e)
     outbox('signed-in', e, ip=ip)
     return token, ''
+
+
+# ---------------------------------------------------------------- changes (advisory sources)
+SOURCE_ID = re.compile(r'[a-z0-9][a-z0-9-]{0,39}')
+
+
+def describe(ch):
+    if ch['action'] == 'add':
+        return f'add the {"web page" if ch["fmt"] == "page" else "feed"} "{ch["name"]}" at {ch["url"]} as an advisory source'
+    return f'remove the advisory source {ch["id"]}'
+
+
+def start_change(con, ip, sess, form):
+    """Check the form, keep the change for this session and mail its admin a code that names
+    the change. Returns (change or None, message)."""
+    action = form.get('action', '')
+    if action == 'add':
+        ch = {'action': 'add', 'name': re.sub(r'[\x00-\x1f\x7f]', '', form.get('name', '')).strip()[:80],
+              'url': form.get('url', '').strip(), 'fmt': form.get('fmt', 'feed')}
+        if not ch['name']:
+            return None, 'Give the source a name.'
+        if not ch['url'].startswith('https://') or len(ch['url']) > 400 or re.search(r'[\s<>"\x00-\x1f]', ch['url']):
+            return None, 'The address must start with https:// (at most 400 characters, no spaces).'
+        if ch['fmt'] not in ('feed', 'page'):
+            return None, 'The format is feed or page.'
+    elif action == 'remove' and SOURCE_ID.fullmatch(form.get('id', '')):
+        ch = {'action': 'remove', 'id': form['id']}
+    else:
+        return None, 'Unknown change.'
+    with _lock:
+        con.execute('DELETE FROM changes WHERE created < ?', (time.time() - float(C['CODE_MIN']) * 60,))
+        con.execute('INSERT OR REPLACE INTO changes (sess, data, created) VALUES (?, ?, ?)',
+                    (sess['hash'], json.dumps(ch), time.time()))
+    request_code(con, ip, sess['email'], 'change:' + sess['hash'], purpose='confirm', summary=describe(ch))
+    return ch, f'A code to confirm this change is on its way to {sess["email"]}. It works once, for 10 minutes.'
+
+
+def confirm_change(con, ip, sess, code):
+    """Returns (True, message) once the change went to root, else (False, message)."""
+    with _lock:
+        row = con.execute('SELECT data, created FROM changes WHERE sess = ?', (sess['hash'],)).fetchone()
+        if not row or time.time() - row[1] > float(C['CODE_MIN']) * 60:
+            return False, 'No change is waiting for a code. Start again.'
+        ok, msg = check_code(con, ip, sess['email'], code, 'change:' + sess['hash'])
+        if not ok:
+            return False, msg
+        con.execute('DELETE FROM changes WHERE sess = ?', (sess['hash'],))
+        ch = json.loads(row[0])
+        audit(con, ip, 'change confirmed', f'{sess["email"]}: {describe(ch)}')
+    outbox('source-' + ch['action'], sess['email'], **{k: v for k, v in ch.items() if k != 'action'})
+    return True, ('Sent to the server. It checks the address (https, a public host) and mails every admin '
+                  'when the source is added or removed, or why not. The list here follows within a few minutes.')
 
 
 # ---------------------------------------------------------------- sessions
@@ -331,7 +393,65 @@ def dashboard(sess):
     cards.append('<div class="card"><h2>Recent mails</h2><table>' + ''.join(
         f'<tr><td>{when(m.get("at"))}</td><td>{esc(m.get("subject", ""))}</td></tr>' for m in mails) + '</table></div>')
     return page('host-guard', head + '<div class="grid">' + ''.join(cards) + '</div>'
-                + '<p class="muted"><a href="/audit">Audit log</a>. Read-only: changes are made on the server.</p>', csrf, who)
+                + '<p class="muted"><a href="/sources">Advisory sources</a> . <a href="/audit">Audit log</a>. '
+                  'Everything else is changed on the server.</p>', csrf, who)
+
+
+def last_read(s):
+    if s.get('failing'):
+        return 'failing: ' + esc(s.get('error', ''))
+    return 'read ' + when(s.get('ok_at')) if s.get('ok_at') else 'not read yet'
+
+
+def remove_form(sess, s):
+    return (f'{esc(s.get("by", ""))}<form method="post" action="/sources/change">'
+            f'<input type="hidden" name="csrf" value="{esc(sess["csrf"])}"><input type="hidden" name="action" value="remove">'
+            f'<input type="hidden" name="id" value="{esc(s.get("id"))}"><button>Remove</button></form>')
+
+
+def sources_page(sess, msg='', err='', form=None):
+    """The sources host-guard reads for advisories, and a form to add or remove the admins' own."""
+    form = form or {}
+    try:
+        with open(C['STATUS_FILE'], encoding='utf-8') as f:
+            srcs = json.load(f).get('sources') or []
+    except (FileNotFoundError, PermissionError, ValueError):
+        srcs = []
+    rows = ''.join(
+        f'<tr><td>{esc(s.get("kind"))}</td><td>{esc(s.get("name"))}<br><span class="muted">{esc(s.get("url"))}</span></td>'
+        f'<td>{last_read(s)}</td>'
+        f'<td>{remove_form(sess, s) if s.get("added") else "built in"}</td></tr>'
+        for s in srcs)
+    note = f'<p class="note">{esc(msg)}</p>' if msg else ''
+    bad = f'<p class="err">{esc(err)}</p>' if err else ''
+    body = (f'{note}{bad}<div class="card"><h2>Sources</h2><p class="muted">Official sources decide (CISA KEV, OSV, '  # nosec B608 (HTML)
+            'NVD, vendor advisories). News, research labs and the sources added here are context: what they say about '
+            'software on this server goes into the advisory mails, but they never start a fix.</p>'
+            '<table><tr><th>Kind</th><th>Source</th><th>Last read</th><th></th></tr>'
+            f'{rows or "<tr><td colspan=4>No status yet.</td></tr>"}</table></div>'
+            '<div class="card"><h2>Add a source you trust</h2><form method="post" action="/sources/change">'
+            f'<input type="hidden" name="csrf" value="{esc(sess["csrf"])}"><input type="hidden" name="action" value="add">'
+            f'<label for="n">Name</label><input id="n" name="name" required maxlength="80" value="{esc(form.get("name", ""))}">'
+            f'<label for="u">Address (https)</label><input id="u" name="url" type="url" required maxlength="400" '
+            f'placeholder="https://" value="{esc(form.get("url", ""))}">'
+            '<label for="f">What it is</label><select id="f" name="fmt"><option value="feed">an RSS or Atom feed</option>'
+            '<option value="page">a web page (read as text, through the reader when one is set)</option></select>'
+            '<button>Add: mail me a code to confirm</button></form>'
+            '<p class="muted">Every change needs a fresh code from your mailbox, even while you are signed in, and '
+            'every admin is mailed about it.</p></div><p><a href="/">Back</a></p>')
+    return page('host-guard advisory sources', body, sess['csrf'], sess['email'])
+
+
+def confirm_page(sess, summary, msg='', err=''):
+    note = f'<p class="note">{esc(msg)}</p>' if msg else ''
+    bad = f'<p class="err">{esc(err)}</p>' if err else ''
+    return page('host-guard: confirm a change', f'<form class="login" method="post" action="/sources/confirm">{note}{bad}'
+                f'<input type="hidden" name="csrf" value="{esc(sess["csrf"])}">'
+                f'<p>Confirm: <b>{esc(summary)}</b></p>'
+                '<label for="c">6-digit code from the mail</label><input id="c" name="code" inputmode="numeric" '
+                'autocomplete="one-time-code" pattern="[0-9]{6}" required maxlength="6">'
+                '<button>Confirm</button><p class="muted"><a href="/sources">Cancel</a></p></form>',
+                sess['csrf'], sess['email'])
 
 
 def email_page(pre, msg=''):
@@ -458,6 +578,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send(200, email_page(pre), cookies=ck)
             if route == '/':
                 return self.send(200, dashboard(sess))
+            if route == '/sources':
+                return self.send(200, sources_page(sess))
             if route == '/audit':
                 rows = con.execute('SELECT at, ip, event, detail FROM audit ORDER BY at DESC LIMIT 200').fetchall()
                 body = '<div class="card"><table><tr><th>When</th><th>From</th><th>Event</th><th>Detail</th></tr>' + ''.join(
@@ -524,6 +646,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not sess or not hmac.compare_digest(sess['csrf'].encode(), (f.get('csrf') or '').encode()):
                 audit(con, self.ip(), 'csrf', route)
                 return self.send(403, b'forbidden', 'text/plain')
+            if route == '/sources/change':
+                ch, msg = start_change(con, self.ip(), sess, f)
+                if not ch:
+                    return self.send(400, sources_page(sess, err=msg, form=f))
+                return self.send(200, confirm_page(sess, describe(ch), msg=msg))
+            if route == '/sources/confirm':
+                ok, msg = confirm_change(con, self.ip(), sess, f.get('code', ''))
+                if not ok:
+                    row = con.execute('SELECT data FROM changes WHERE sess = ?', (sess['hash'],)).fetchone()
+                    if row:
+                        return self.send(401, confirm_page(sess, describe(json.loads(row[0])), err=msg))
+                    return self.send(401, sources_page(sess, err=msg))
+                return self.send(200, sources_page(sess, msg=msg))
             if route == '/logout':
                 con.execute('DELETE FROM sessions WHERE token_hash = ?', (sess['hash'],))
                 audit(con, self.ip(), 'sign-out', sess['email'])
@@ -557,6 +692,12 @@ def main(argv):
         n = int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else 50
         for a, i, e, d in db().execute('SELECT at, ip, event, detail FROM audit ORDER BY at DESC LIMIT ?', (n,)):
             print(*(''.join(ch if ch.isprintable() else '?' for ch in str(x)) for x in (when(a), i, e, d)))   # no terminal escapes
+    elif argv == ['logout-all']:
+        con = db()
+        n = con.execute('DELETE FROM sessions').rowcount
+        con.execute('DELETE FROM changes')
+        audit(con, 'console', 'everyone signed out', f'{n} session(s)')
+        print(f'{n} session(s) ended: everyone signs in again with a new code')
     elif argv and argv[0] == 'init-admin':
         print('There is no panel password any more: the admins sign in with their email address and a code mailed '
               'to it. The admins are MAIL_TO (or PANEL_ADMINS) in /etc/host-guard/guard.conf.')

@@ -336,3 +336,86 @@ def test_the_audit_listing_prints_no_terminal_control_characters(hp, capsys):
     out = capsys.readouterr().out
     assert 'evil.example' in out
     assert '\x1b' not in out and '\x07' not in out
+
+
+# ---------------------------------------------------------------- advisory sources (two steps, a fresh code)
+def change(c, **form):
+    c.req('GET', '/sources')
+    return c.req('POST', '/sources/change', dict({'csrf': c.form_csrf}, **form))
+
+
+def test_adding_a_source_needs_a_fresh_code_that_names_the_change(hp):
+    c = Client(hp)
+    assert c.login().status == 303
+    outbox(hp)
+    r = change(c, action='add', name='Example News', url='https://news.example/feed', fmt='feed')
+    assert r.status == 200 and 'Confirm: <b>add the feed' in r.text
+    items = outbox(hp)
+    assert [(x['kind'], x['purpose']) for x in items] == [('code', 'confirm')]
+    assert 'Example News' in items[0]['summary'] and items[0]['email'] == ADMIN
+    r = c.req('POST', '/sources/confirm', {'csrf': c.form_csrf, 'code': items[0]['code']})
+    assert r.status == 200 and 'Sent to the server' in r.text
+    sent = outbox(hp)
+    assert [(x['kind'], x['name'], x['url'], x['fmt'], x['email']) for x in sent] == [
+        ('source-add', 'Example News', 'https://news.example/feed', 'feed', ADMIN)]
+    events = [e for (e,) in hp.db().execute('SELECT event FROM audit')]
+    assert 'change code requested' in events and 'change confirmed' in events
+    r = c.req('POST', '/sources/confirm', {'csrf': c.form_csrf, 'code': items[0]['code']})
+    assert r.status == 401 and outbox(hp) == []                              # single use
+
+
+def test_a_change_code_works_only_in_the_session_that_asked_for_it(hp):
+    a, b = Client(hp), Client(hp)
+    a.login()
+    b.login()
+    outbox(hp)
+    change(a, action='add', name='Mine', url='https://news.example/', fmt='page')
+    code = outbox(hp)[0]['code']
+    change(b, action='remove', id='mine')
+    outbox(hp)
+    assert b.req('POST', '/sources/confirm', {'csrf': b.form_csrf, 'code': code}).status == 401
+    assert [x['kind'] for x in outbox(hp)] == []
+    assert a.req('POST', '/sources/confirm', {'csrf': a.form_csrf, 'code': code}).status == 200
+
+
+def test_a_stolen_session_cannot_change_sources_without_the_mailbox(hp):
+    c = Client(hp)
+    c.login()
+    outbox(hp)
+    change(c, action='add', name='Planted', url='https://attacker.example/', fmt='feed')
+    outbox(hp)                                                               # the code went to the admin, not here
+    for i in range(5):
+        c.req('POST', '/sources/confirm', {'csrf': c.form_csrf, 'code': str(100000 + i)})
+    assert not [x for x in outbox(hp) if x['kind'].startswith('source-')]
+
+
+def test_source_changes_are_checked_and_need_the_session_token(hp):
+    c = Client(hp)
+    c.login()
+    outbox(hp)
+    for bad in ({'action': 'add', 'name': 'x', 'url': 'http://news.example/'},
+                {'action': 'add', 'name': 'x', 'url': 'https://news.example/ a'},
+                {'action': 'add', 'name': '', 'url': 'https://news.example/'},
+                {'action': 'add', 'name': 'x', 'url': 'https://news.example/', 'fmt': 'script'},
+                {'action': 'remove', 'id': '../../etc'},
+                {'action': 'drop-table'}):
+        assert change(c, **bad).status == 400
+    assert outbox(hp) == []
+    c.req('GET', '/sources')
+    r = c.req('POST', '/sources/change', {'csrf': 'forged', 'action': 'add', 'name': 'x', 'url': 'https://n.example/'})
+    assert r.status == 403 and outbox(hp) == []
+    assert Client(hp).req('GET', '/sources').text.count('name="email"') == 1  # signed out: the sign-in page
+
+
+def test_the_sources_page_lists_what_root_exported_and_escapes_it(hp):
+    json.dump({'site': 'x', 'generated': time.time(), 'sources': [
+        {'id': 'cisa-kev', 'name': 'CISA KEV', 'url': 'https://www.cisa.gov/x', 'kind': 'official', 'added': False},
+        {'id': 'evil', 'name': '<script>alert(1)</script>', 'url': 'https://e.example/"><b>', 'kind': 'context',
+         'added': True, 'by': 'ops@example.com (on the dashboard)', 'failing': True, 'error': 'HTTP 404'}]},
+              open(hp.C['STATUS_FILE'], 'w'))
+    c = Client(hp)
+    c.login()
+    page = c.req('GET', '/sources').text
+    assert 'CISA KEV' in page and 'built in' in page and 'failing: HTTP 404' in page
+    assert '<script>alert' not in page and '&lt;script&gt;' in page and '"><b>' not in page
+    assert 'value="evil"' in page and 'Remove' in page
