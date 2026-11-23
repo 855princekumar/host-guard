@@ -419,3 +419,49 @@ def test_the_sources_page_lists_what_root_exported_and_escapes_it(hp):
     assert 'CISA KEV' in page and 'built in' in page and 'failing: HTTP 404' in page
     assert '<script>alert' not in page and '&lt;script&gt;' in page and '"><b>' not in page
     assert 'value="evil"' in page and 'Remove' in page
+
+
+# ---------------------------------------------------------------- advisories and approvals
+def approve(c, **form):
+    c.req('GET', '/advisories')
+    return c.req('POST', '/change', dict({'csrf': c.form_csrf, 'action': 'approve'}, **form))
+
+
+def test_fix_now_needs_a_fresh_code_and_reaches_root_as_an_approval(hp):
+    c = Client(hp)
+    c.login()
+    outbox(hp)
+    r = approve(c, verb='fix', target='deadbeef', what='openssl 3.0.2: CVE-2026-1111')
+    assert r.status == 200 and 'Confirm: <b>fix now finding deadbeef (openssl 3.0.2: CVE-2026-1111)' in r.text
+    code = outbox(hp)[0]['code']
+    r = c.req('POST', '/confirm', {'csrf': c.form_csrf, 'code': code})
+    assert r.status == 200 and 'Open findings' in r.text
+    assert [(x['kind'], x['verb'], x['target'], x['email']) for x in outbox(hp)] == [('approve', 'fix', 'deadbeef', ADMIN)]
+
+
+def test_approvals_are_checked_before_any_code_is_sent(hp):
+    c = Client(hp)
+    c.login()
+    outbox(hp)
+    for bad in ({'verb': 'fix', 'target': '../../x'}, {'verb': 'reboot', 'target': 'deadbeef'},
+                {'verb': 'shell', 'target': 'deadbeef'}, {'verb': 'fix', 'target': 'now'}, {'verb': 'hold'}):
+        assert approve(c, **bad).status == 400
+    assert outbox(hp) == []
+    assert approve(c, verb='reboot', target='now').status == 200
+
+
+def test_the_advisories_page_shows_findings_waiting_approvals_and_the_log_escaped(hp):
+    json.dump({'site': 'x', 'generated': time.time(), 'reboot_needed': True,
+               'advisories': [{'id': 'deadbeef', 'tier': 'Critical', 'status': 'open', 'name': '<img src=x>', 'where': 'host',
+                               'vuln': 'CVE-2026-1111', 'fixable': True}],
+               'approvals': {'waiting': [{'action': 'reboot', 'target': 'now', 'summary': 'reboot now', 'need': 2,
+                                          'expires': time.time() + 60, 'approvals': [{'by': 'sec@example.com', 'channel': 'email'}]}],
+                             'log': [{'at': time.time(), 'action': 'hold', 'target': 'deadbeef', 'by': 'sec@example.com',
+                                      'channel': 'email', 'result': 'done: held'}]}},
+              open(hp.C['STATUS_FILE'], 'w'))
+    c = Client(hp)
+    c.login()
+    page = c.req('GET', '/advisories').text
+    assert '<img src=x>' not in page and '&lt;img src=x&gt;' in page
+    assert 'Fix now' in page and 'Hold' in page and 'Approve a reboot now' in page
+    assert '1 of 2: sec@example.com (email)' in page and 'done: held' in page

@@ -239,9 +239,15 @@ def sign_in(con, ip, email, code, owner):
 
 # ---------------------------------------------------------------- changes (advisory sources)
 SOURCE_ID = re.compile(r'[a-z0-9][a-z0-9-]{0,39}')
+FINDING_ID = re.compile(r'[0-9a-f]{8}')
+VERBS = {'fix': 'fix now', 'hold': 'hold the automatic fix of', 'reboot': 'approve a reboot of the server now'}
 
 
 def describe(ch):
+    if ch['action'] == 'approve':
+        if ch['verb'] == 'reboot':
+            return VERBS['reboot']
+        return f'{VERBS[ch["verb"]]} finding {ch["target"]}' + (f' ({ch["what"]})' if ch.get('what') else '')
     if ch['action'] == 'add':
         return f'add the {"web page" if ch["fmt"] == "page" else "feed"} "{ch["name"]}" at {ch["url"]} as an advisory source'
     return f'remove the advisory source {ch["id"]}'
@@ -262,6 +268,11 @@ def start_change(con, ip, sess, form):
             return None, 'The format is feed or page.'
     elif action == 'remove' and SOURCE_ID.fullmatch(form.get('id', '')):
         ch = {'action': 'remove', 'id': form['id']}
+    elif action == 'approve' and form.get('verb') in ('fix', 'hold') and FINDING_ID.fullmatch(form.get('target', '')):
+        ch = {'action': 'approve', 'verb': form['verb'], 'target': form['target'],
+              'what': re.sub(r'[\x00-\x1f\x7f]', '', form.get('what', ''))[:120]}
+    elif action == 'approve' and form.get('verb') == 'reboot' and form.get('target') == 'now':
+        ch = {'action': 'approve', 'verb': 'reboot', 'target': 'now'}
     else:
         return None, 'Unknown change.'
     with _lock:
@@ -284,6 +295,10 @@ def confirm_change(con, ip, sess, code):
         con.execute('DELETE FROM changes WHERE sess = ?', (sess['hash'],))
         ch = json.loads(row[0])
         audit(con, ip, 'change confirmed', f'{sess["email"]}: {describe(ch)}')
+    if ch['action'] == 'approve':
+        outbox('approve', sess['email'], verb=ch['verb'], target=ch['target'])
+        return True, ('Sent to the server. It mails every admin what was done (a reboot needs another admin '
+                      'too). This page follows within a minute.')
     outbox('source-' + ch['action'], sess['email'], **{k: v for k, v in ch.items() if k != 'action'})
     return True, ('Sent to the server. It checks the address (https, a public host) and mails every admin '
                   'when the source is added or removed, or why not. The list here follows within a few minutes.')
@@ -328,6 +343,7 @@ input{width:100%;padding:8px;border:1px solid #c5cbd5;border-radius:6px;font:inh
 button{margin-top:14px;padding:8px 14px;border:0;border-radius:6px;background:#2f5bd3;color:#fff;font:inherit;cursor:pointer}
 .err{color:#c62828}.note{color:#067647}.muted{color:#8a94a6;font-size:13px}pre{white-space:pre-wrap;margin:0;font-size:13px}
 .who{margin-left:auto;font-size:13px;color:#8a94a6}
+form.inline{display:inline-block;margin-right:6px}form.inline button{margin-top:4px;padding:4px 10px}
 '''
 SECTIONS = [('health', 'Health'), ('watch', 'Intrusion watch'), ('bans', 'Bans'), ('backup', 'Backup'),
             ('restore_test', 'Restore test'), ('scan', 'Scan'), ('feeds', 'Early warning'), ('lockdown', 'Lockdown')]
@@ -393,7 +409,8 @@ def dashboard(sess):
     cards.append('<div class="card"><h2>Recent mails</h2><table>' + ''.join(
         f'<tr><td>{when(m.get("at"))}</td><td>{esc(m.get("subject", ""))}</td></tr>' for m in mails) + '</table></div>')
     return page('host-guard', head + '<div class="grid">' + ''.join(cards) + '</div>'
-                + '<p class="muted"><a href="/sources">Advisory sources</a> . <a href="/audit">Audit log</a>. '
+                + '<p class="muted"><a href="/advisories">Advisories and approvals</a> . '
+                  '<a href="/sources">Advisory sources</a> . <a href="/audit">Audit log</a>. '
                   'Everything else is changed on the server.</p>', csrf, who)
 
 
@@ -442,15 +459,72 @@ def sources_page(sess, msg='', err='', form=None):
     return page('host-guard advisory sources', body, sess['csrf'], sess['email'])
 
 
+def status():
+    try:
+        with open(C['STATUS_FILE'], encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, PermissionError, ValueError):
+        return {}
+
+
+def approve_form(sess, verb, target, label, what=''):
+    return (f'<form method="post" action="/change" class="inline"><input type="hidden" name="csrf" value="{esc(sess["csrf"])}">'
+            f'<input type="hidden" name="action" value="approve"><input type="hidden" name="verb" value="{esc(verb)}">'
+            f'<input type="hidden" name="target" value="{esc(target)}"><input type="hidden" name="what" value="{esc(what)}">'
+            f'<button>{esc(label)}</button></form>')
+
+
+def advisories_page(sess, msg='', err=''):
+    """Open Critical and Moderate findings with Fix now and Hold, a pending reboot, and who
+    approved what through which channel (email, dashboard, console)."""
+    s = status()
+    rows = ''.join(
+        f'<tr><td>{esc(a.get("tier"))}</td><td>{esc(a.get("name"))} on {esc(a.get("where"))}<br>'
+        f'<span class="muted">{esc(a.get("vuln"))} . {esc(a.get("status"))}'
+        f'{" by " + esc(a.get("held_by")) if a.get("held_by") else ""}'
+        f'{", automatic fix " + when(a.get("due")) if a.get("due") and a.get("status") == "open" else ""}</span></td><td>'
+        + (approve_form(sess, 'fix', a.get('id', ''), 'Fix now', f'{a.get("name")}: {a.get("vuln")}')
+           + (approve_form(sess, 'hold', a.get('id', ''), 'Hold', f'{a.get("name")}: {a.get("vuln")}')
+              if a.get('status') in ('open', 'not applied') else '')
+           if a.get('fixable') else '<span class="muted">fixed by hand</span>') + '</td></tr>'
+        for a in s.get('advisories') or [])
+    ap = s.get('approvals') or {}
+    waiting = ''.join(
+        f'<tr><td>{esc(w.get("action"))} {esc(w.get("target"))}</td><td>{esc(w.get("summary"))}</td><td>'
+        f'{len(w.get("approvals") or [])} of {esc(w.get("need"))}: '
+        + esc(', '.join(f'{x.get("by")} ({x.get("channel")})' for x in w.get('approvals') or []) or 'none yet')
+        + f'<br><span class="muted">until {when(w.get("expires"))}</span></td></tr>'
+        for w in ap.get('waiting') or [])
+    log = ''.join(f'<tr><td>{when(x.get("at"))}</td><td>{esc(x.get("channel"))}</td><td>{esc(x.get("by"))}</td>'
+                  f'<td>{esc(x.get("action"))} {esc(x.get("target"))}</td><td>{esc(x.get("result"))}</td></tr>'
+                  for x in reversed(ap.get('log') or []))
+    reboot = ('<div class="card"><h2>Reboot</h2><p>Security updates need a reboot. It happens in the maintenance '
+              'window after a backup; to reboot now, two admins approve (a backup is taken first).</p>'
+              + approve_form(sess, 'reboot', 'now', 'Approve a reboot now') + '</div>') if s.get('reboot_needed') else ''
+    note = f'<p class="note">{esc(msg)}</p>' if msg else ''
+    bad = f'<p class="err">{esc(err)}</p>' if err else ''
+    body = (f'{note}{bad}<div class="card"><h2>Open findings</h2><p class="muted">Critical and Moderate findings of '
+            'the advisories (hostguard shield). Every button needs a fresh code from your mailbox and is mailed to every '
+            'admin.</p><table><tr><th>Tier</th><th>Finding</th><th></th></tr>'
+            f'{rows or "<tr><td colspan=3>None open.</td></tr>"}</table></div>{reboot}'
+            '<div class="card"><h2>Waiting for approval</h2><table><tr><th>Action</th><th>What</th><th>Approved</th></tr>'
+            f'{waiting or "<tr><td colspan=3>Nothing waits.</td></tr>"}</table></div>'
+            '<div class="card"><h2>Approvals log</h2><p class="muted">Who approved what, and how: by email reply, on '
+            'this dashboard or on the server (sudo hostguard approvals has the full log).</p>'
+            '<table><tr><th>When</th><th>How</th><th>Who</th><th>Action</th><th>Result</th></tr>'
+            f'{log or "<tr><td colspan=5>Nothing yet.</td></tr>"}</table></div><p><a href="/">Back</a></p>')
+    return page('host-guard advisories', body, sess['csrf'], sess['email'])
+
+
 def confirm_page(sess, summary, msg='', err=''):
     note = f'<p class="note">{esc(msg)}</p>' if msg else ''
     bad = f'<p class="err">{esc(err)}</p>' if err else ''
-    return page('host-guard: confirm a change', f'<form class="login" method="post" action="/sources/confirm">{note}{bad}'
+    return page('host-guard: confirm a change', f'<form class="login" method="post" action="/confirm">{note}{bad}'
                 f'<input type="hidden" name="csrf" value="{esc(sess["csrf"])}">'
                 f'<p>Confirm: <b>{esc(summary)}</b></p>'
                 '<label for="c">6-digit code from the mail</label><input id="c" name="code" inputmode="numeric" '
                 'autocomplete="one-time-code" pattern="[0-9]{6}" required maxlength="6">'
-                '<button>Confirm</button><p class="muted"><a href="/sources">Cancel</a></p></form>',
+                '<button>Confirm</button><p class="muted"><a href="/">Cancel</a></p></form>',
                 sess['csrf'], sess['email'])
 
 
@@ -580,6 +654,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send(200, dashboard(sess))
             if route == '/sources':
                 return self.send(200, sources_page(sess))
+            if route == '/advisories':
+                return self.send(200, advisories_page(sess))
             if route == '/audit':
                 rows = con.execute('SELECT at, ip, event, detail FROM audit ORDER BY at DESC LIMIT 200').fetchall()
                 body = '<div class="card"><table><tr><th>When</th><th>From</th><th>Event</th><th>Detail</th></tr>' + ''.join(
@@ -646,19 +722,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not sess or not hmac.compare_digest(sess['csrf'].encode(), (f.get('csrf') or '').encode()):
                 audit(con, self.ip(), 'csrf', route)
                 return self.send(403, b'forbidden', 'text/plain')
-            if route == '/sources/change':
+            if route in ('/change', '/sources/change'):
+                back = advisories_page if f.get('action') == 'approve' else sources_page
                 ch, msg = start_change(con, self.ip(), sess, f)
                 if not ch:
-                    return self.send(400, sources_page(sess, err=msg, form=f))
+                    return self.send(400, back(sess, err=msg) if back is advisories_page else back(sess, err=msg, form=f))
                 return self.send(200, confirm_page(sess, describe(ch), msg=msg))
-            if route == '/sources/confirm':
+            if route in ('/confirm', '/sources/confirm'):
+                row = con.execute('SELECT data FROM changes WHERE sess = ?', (sess['hash'],)).fetchone()
+                back = advisories_page if row and json.loads(row[0]).get('action') == 'approve' else sources_page
                 ok, msg = confirm_change(con, self.ip(), sess, f.get('code', ''))
                 if not ok:
                     row = con.execute('SELECT data FROM changes WHERE sess = ?', (sess['hash'],)).fetchone()
                     if row:
                         return self.send(401, confirm_page(sess, describe(json.loads(row[0])), err=msg))
-                    return self.send(401, sources_page(sess, err=msg))
-                return self.send(200, sources_page(sess, msg=msg))
+                    return self.send(401, back(sess, err=msg))
+                return self.send(200, back(sess, msg=msg))
             if route == '/logout':
                 con.execute('DELETE FROM sessions WHERE token_hash = ?', (sess['hash'],))
                 audit(con, self.ip(), 'sign-out', sess['email'])

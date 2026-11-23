@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.5.0] - 2026-11-23
+
+### Added
+- **Advisories (`hostguard shield`, every 6 hours).** host-guard lists every OS package (and
+  which ones running programs load), the kernel, every container and its packages, upstream
+  server programs and the libraries on disk. It checks them against CISA KEV, OSV, NVD,
+  FIRST EPSS, endoflife.date and vendor pages, and lists what it cannot check. Findings are
+  tiered Critical, Moderate or Low; a finding with no fix released yet is Low unless it is
+  exploited. With `AUTO_FIX=critical`, a Critical fix runs by itself after a hold the admins
+  can stop, inside `FIX_WINDOW`, with a restore point first, a health check after, and an
+  automatic rollback. ([docs/ADVISORIES.md](docs/ADVISORIES.md))
+- **Sources the admins trust.** Admins add or remove them on the dashboard (each change is
+  confirmed with a fresh mailed code and mailed to every admin) or with `hostguard sources`.
+  They are always context, never official. They must be https on a public host, checked when
+  added, before each read, and on the connection actually made, through every redirect.
+  Web pages can be read through a reader (`READER`, e.g. Jina Reader) as Markdown.
+- **Approvals by reply, dashboard and console.** With `REPLY_ACTIONS=on`, a Critical mail
+  carries single-use lines (`FIX hg-...`, `HOLD hg-...`) and a pending reboot carries
+  `REBOOT hg-...`; an admin replies with that line first. Replies are read over IMAP every
+  2 minutes. A reply acts only when all of these hold:
+  - it comes from an admin address;
+  - the inbox's own mail server reports DMARC pass (the topmost `Authentication-Results`);
+  - it carries a live code for that one action.
+
+  Nothing else in a mail is ever run. A reboot needs two different admins on any channels.
+  A forged reply carrying a real code voids that code and warns every admin. Every approval
+  and refusal is logged with who and the channel (email, dashboard, console):
+  `hostguard approvals`, and the dashboard's Approvals log.
+  ([docs/APPROVALS.md](docs/APPROVALS.md))
+- **The dashboard's Advisories page:** the open Critical and Moderate findings with
+  **Fix now** and **Hold**, **Approve a reboot now**, what waits for a second admin, and the
+  approvals log. Every button is confirmed with a fresh code mailed for that one change, and
+  root checks it again.
+- **Red team:**
+  - a new stage against a real IMAP server: forged senders, a planted DMARC verdict, another
+    server's verdict, a non-admin, commands instead of an action line, quoted codes, replays,
+    a one-admin reboot (MAIL-0 to MAIL-9);
+  - a taken-over panel feeding root approvals and an internal source (PANEL-23);
+  - nightly: an OWASP ZAP baseline scan of the panel.
+- **CI:**
+  - a nightly run of everything;
+  - fuzz tests of every parser that reads outside data (replies, feeds, pages, vendor pages,
+    source addresses);
+  - [docs/CI.md](docs/CI.md) on what runs, and how the suite is kept healthy and grows.
+
+### Fixed
+- Found by the new fuzzer before release: a reply whose headers the mail parser could not read
+  raised an exception. Left unread in the inbox, one such mail would have stopped every reply
+  behind it. Now it is refused and logged, and the rest go on.
+
 ## [0.4.0] - 2026-11-19
 
 ### Changed

@@ -1187,7 +1187,7 @@ def describe(f, with_fix=True):
 
 
 def run(hg):
-    """The hourly run: inventory, findings, mails by tier, fixes that are due."""
+    """The run every 6 hours (host-guard-shield.timer): inventory, findings, mails by tier, fixes that are due."""
     state = hg.load('shield.json')
     first = 'known' not in state
     inv = inventory(hg)
@@ -1241,7 +1241,7 @@ def _baseline_body(inv, findings, state, hold_h, hg):
     crit = [f for f in findings.values() if f['tier'] == 'Critical']
     if crit:
         lines += ['', 'CRITICAL, act now:'] + [describe(f) for f in crit[:15]]
-        lines.append(_auto_note(hg, hold_h))
+        lines.append(_auto_note(hg, hold_h) + _reply_note(hg, crit))
     mod = [f for f in findings.values() if f['tier'] == 'Moderate']
     if mod:
         lines += ['', 'Moderate (the daily report keeps the list):'] + [describe(f, False) for f in mod[:10]]
@@ -1262,6 +1262,20 @@ def _auto_note(hg, hold_h):
             '  Ignore:    sudo hostguard ignore ID "reason"')
 
 
+def _reply_note(hg, crit):
+    """The lines that let an admin fix or hold a Critical finding by replying (approvals.py)."""
+    items = []
+    for f in crit[:5]:
+        if f.get('plan'):
+            what = f'{f["comp"]["name"]} {f["comp"]["version"]}: {f["vuln"]}'
+            items += [('fix', f['fid'], what), ('hold', f['fid'], what)]
+    try:
+        return hg.approvals_module().offer_text(hg, items)
+    except Exception as e:                                   # the advisory mail goes out anyway
+        print(f'shield: no reply codes ({e})')
+        return ''
+
+
 def _mail_new(hg, new, chatter, hold_h):
     crit = [f for f in new.values() if f['tier'] == 'Critical']
     mod = [f for f in new.values() if f['tier'] == 'Moderate']
@@ -1270,7 +1284,7 @@ def _mail_new(hg, new, chatter, hold_h):
         subj = (f'{top["comp"]["name"]} {top["comp"]["version"]}: {top["vuln"]}'
                 + (' (exploited)' if top['kev'] else f' (CVSS {top["cvss"]})' if top.get('cvss') else '')
                 + (f' and {len(crit) - 1} more' if len(crit) > 1 else ''))
-        body = '\n\n'.join(describe(f) for f in crit) + '\n' + _auto_note(hg, hold_h)
+        body = '\n\n'.join(describe(f) for f in crit) + '\n' + _auto_note(hg, hold_h) + _reply_note(hg, crit)
         if chatter:
             body += '\n\nWhat researchers and the news say about software on this server:\n' + \
                     '\n'.join(f'  {c["source"]}: {c["title"]}  {c["link"]}' for c in chatter[:8])
@@ -1281,10 +1295,10 @@ def _mail_new(hg, new, chatter, hold_h):
     if chatter and not crit:
         hg.mail(subject=f'{len(chatter)} report(s) about software on this server', level='info', category='Advisory',
                 body='Research labs and the news, read as context. Nothing here triggers a fix; the official '
-                'sources are checked every hour.\n\n' + '\n'.join(f'{c["source"]}: {c["title"]}\n  {c["link"]}' for c in chatter[:20]))
+                'sources are checked every 6 hours.\n\n' + '\n'.join(f'{c["source"]}: {c["title"]}\n  {c["link"]}' for c in chatter[:20]))
 
 
-def due_fixes(hg, state, only=None, force=False):
+def due_fixes(hg, state, only=None, force=False, by=''):
     """Apply the fixes that are due (or the one asked for). Mails each result."""
     known = state.setdefault('known', {})
     done = []
@@ -1305,17 +1319,17 @@ def due_fixes(hg, state, only=None, force=False):
                                                 ('at', 'status', 'detail', 'restore_point')}})
         state['fix_log'] = state['fix_log'][-100:]
         hg.save(state, 'shield.json')
-        _mail_fix(hg, v, res, force)
+        _mail_fix(hg, v, res, by if force else '')
         done.append(k)
     return done
 
 
-def _mail_fix(hg, v, res, by_admin):
+def _mail_fix(hg, v, res, by):
     rp = res['restore_point']
     rid = os.path.basename(rp)
     head = {'fixed': 'Fixed', 'rolled back': 'Fix rolled back', 'rollback FAILED': 'Fix FAILED and rollback FAILED',
             'not applied': 'Fix not applied'}[res['status']]
-    body = [f'{head}: {v["name"]}, {v["vuln"]} ({"by an admin" if by_admin else "automatically, after the hold"}).',
+    body = [f'{head}: {v["name"]}, {v["vuln"]} ({"approved by " + by if by else "automatically, after the hold"}).',
             f'What was done: {res["detail"]}']
     if res.get('undo'):
         body.append(f'Rollback: {res["undo"]}')
@@ -1328,12 +1342,42 @@ def _mail_fix(hg, v, res, by_admin):
     hg.mail(subject=f'{head}: {v["name"]} ({v["vuln"]})', body='\n'.join(body), level=level, category='Advisory')
 
 
+def act(hg, state, action, k, by):
+    """Hold or fix finding k, for an admin `by` (who, and through which channel). Every
+    channel (console, dashboard, a reply by mail) comes through here. Returns (ok, message)."""
+    known = state.setdefault('known', {})
+    if k not in known:
+        return False, f'no finding {k}'
+    v = known[k]
+    if action == 'hold':
+        if v['status'] not in ('open', 'not applied'):
+            return False, f'{k} is {v["status"]}, nothing to hold'
+        v.update(status='held', held_by=by, held_at=time.time())
+        hg.save(state, 'shield.json')
+        hg.mail(subject=f'Automatic fix held: {v["name"]} ({v["vuln"]})', category='Advisory', level='info',
+                body=f'{by} held the automatic fix for {k}. It stays open in the daily report.\n'
+                f'Fix it later:  sudo hostguard fix {k}')
+        return True, 'held'
+    if action == 'fix':
+        if not v.get('plan'):
+            return False, f'no automatic fix for {k}: {v.get("manual") or "see the finding"}'
+        if v['status'] not in ('open', 'held', 'not applied'):
+            return False, f'{k} is {v["status"]}, nothing to fix'
+        done = due_fixes(hg, state, only=k, force=True, by=by)
+        return (v['status'] == 'fixed'), (v['status'] if done else 'not applied')
+    return False, f'unknown action {action}'
+
+
+def console_by():
+    return f'{os.environ.get("SUDO_USER") or "root"} on the server'
+
+
 def report_lines(hg):
     """The daily report's part."""
     state = hg.load('shield.json')
     last = state.get('last')
     if not last:
-        return ['Not run yet (hostguard advisories runs every hour).']
+        return ['Not run yet (hostguard shield runs every 6 hours).']
     t = last['tiers']
     lines = [f'Inventory: {last["components"]} components, {last["containers"]} container(s); checked {hg.stamp(last["at"])}',
              f'Open: {t.get("Critical", 0)} critical, {t.get("Moderate", 0)} moderate, {t.get("Low", 0)} low']
@@ -1385,14 +1429,15 @@ def cli(hg, args):
         if k not in known:
             print(f'no finding {k}: see  hostguard findings')
             return 1
-        if cmd == 'hold':
-            known[k]['status'] = 'held'
-            hg.save(state, 'shield.json')
-            hg.mail(subject=f'Automatic fix held: {known[k]["name"]} ({known[k]["vuln"]})', category='Advisory', level='info',
-                    body=f'An admin held the automatic fix for {k}. It stays open in the daily report.\n'
-                    f'Fix it later:  sudo hostguard fix {k}')
-            print('held')
-            return 0
+        if cmd in ('hold', 'fix'):
+            by = console_by()
+            ok, msg = act(hg, state, cmd, k, f'{by} (console)')
+            try:
+                hg.approvals_module().record(hg, cmd, k, by, 'console', ('done: ' if ok else 'not done: ') + msg)
+            except Exception as e:
+                print(f'(not logged: {e})')
+            print(msg)
+            return 0 if ok else 1
         if cmd == 'ignore':
             reason = ' '.join(args[2:]).strip()
             if not reason:
@@ -1401,15 +1446,9 @@ def cli(hg, args):
             known[k].update(status='ignored', reason=reason[:200], ignored_at=time.time())
             hg.save(state, 'shield.json')
             hg.mail(subject=f'Finding ignored: {known[k]["name"]} ({known[k]["vuln"]})', category='Advisory', level='info',
-                    body=f'An admin marked {k} as not applying here: {reason[:200]}')
+                    body=f'{console_by()} marked {k} as not applying here: {reason[:200]}')
             print('ignored')
             return 0
-        if not known[k].get('plan'):
-            print(f'no automatic fix for {k}: {known[k].get("manual") or "see the finding"}')
-            return 1
-        done = due_fixes(hg, state, only=k, force=True)
-        print(known[k]['status'] if done else 'not applied')
-        return 0 if known[k]['status'] == 'fixed' else 1
     if cmd == 'undo' and len(args) == 2:
         rid = os.path.basename(args[1])
         d = os.path.join(hg.C['BACKUP_DIR'], 'restore-points', rid)

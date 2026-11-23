@@ -26,7 +26,7 @@ For anyone running a product on a single cloud instance, VPS or bare-metal box w
 [![Rollback](https://img.shields.io/badge/install-manifest%20%2B%20rollback-success)](docs/VERSIONS.md)
 [![No agent](https://img.shields.io/badge/agent-none-lightgrey)](#why-host-guard)
 
-[Install](docs/INSTALL.md) · [Versions and rollback](docs/VERSIONS.md) · [How it works](docs/HOW-IT-WORKS.md) · [Clouds](docs/CLOUDS.md) · [Mail](docs/MAIL.md) · [Red team](docs/REDTEAM.md) · [Configuration](docs/CONFIGURATION.md) · [Running cost](docs/COST.md) · [Panel](docs/PANEL.md) · [Releasing](docs/RELEASING.md) · [Security](SECURITY.md)
+[Install](docs/INSTALL.md) · [Versions and rollback](docs/VERSIONS.md) · [How it works](docs/HOW-IT-WORKS.md) · [Advisories](docs/ADVISORIES.md) · [Approvals](docs/APPROVALS.md) · [Clouds](docs/CLOUDS.md) · [Mail](docs/MAIL.md) · [Red team](docs/REDTEAM.md) · [Configuration](docs/CONFIGURATION.md) · [Running cost](docs/COST.md) · [Panel](docs/PANEL.md) · [Releasing](docs/RELEASING.md) · [CI and testing](docs/CI.md) · [Security](SECURITY.md)
 
 </div>
 
@@ -51,6 +51,8 @@ except the mail and, if you want, an encrypted backup copy in S3.
 | Health | every 5 min | disk, memory, containers, HTTPS answer, TLS certificate, database replication, backup age, pending reboot, new bans | one alert, then a "resolved" mail |
 | Intrusion watch | every 5 min | extra root accounts, new login accounts and SSH keys, changed sudo, SSH, cron and systemd files, rootkit preload, crypto miners, programs in memory-only folders, root SSH from the internet | critical mail at once; extra root accounts locked, miners killed (a copy kept); optional lockdown of the web server |
 | Early warning | every 6 h | CISA's exploited vulnerabilities, Ubuntu security notices, OSV advisories for the Python packages in your containers, matched to what runs here | mail with the advisory and the fixed version |
+| Advisories | every 6 h | every package, container, server program and library against CISA KEV, OSV, NVD, EPSS, endoflife.date and vendor pages; news, research labs and the admins' own sources as context ([advisories](docs/ADVISORIES.md)) | Critical at once, Moderate per run; optional automatic fix after a hold, with a restore point and rollback |
+| Approvals | every 2 min (optional) | an admin fixes, holds or approves a reboot by replying to the mail, on the dashboard or on the server; only fixed actions, single-use codes, the mail server's DMARC verdict, two admins for a reboot ([approvals](docs/APPROVALS.md)) | every approval and refusal logged with who and how, and mailed to every admin |
 | Backup | nightly | your database (MariaDB or PostgreSQL) or any command's output, gzipped, encrypted with AES-256, checksummed, newest 3 kept, optional S3 copy | alert if the dump, encryption or upload fails |
 | Restore test | weekly | the newest backup decrypted and loaded into a throwaway database (or unpacked completely) | alert: a backup that does not restore is no backup |
 | Scan | weekly | Trivy on every running image, Lynis on the host | mail with what to fix |

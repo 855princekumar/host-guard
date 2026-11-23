@@ -154,6 +154,7 @@ step "host-guard program and settings (no secrets in guard.conf)"
 install -m 0755 "$HERE/hostguard.py" /usr/local/sbin/hostguard
 install -d -m 0755 /usr/local/lib/host-guard
 install -m 0644 "$HERE/shield.py" /usr/local/lib/host-guard/shield.py     # advisories: hostguard shield
+install -m 0644 "$HERE/approvals.py" /usr/local/lib/host-guard/approvals.py   # approvals: hostguard replies / approvals
 CONF=/etc/host-guard/guard.conf
 if [ ! -f "$CONF" ]; then
   umask 077
@@ -235,7 +236,7 @@ done
 sed -i "s|@REPORT@|$REPORT|; s|@TZ@|$TZ_|" /etc/systemd/system/host-guard-report.timer
 sed -i "s|@MAINT@|$MAINT|; s|@TZ@|$TZ_|" /etc/systemd/system/host-guard-patch-window.timer
 systemctl daemon-reload
-for t in health watch feeds shield scan backup restore-test patch-window report; do
+for t in health watch feeds shield replies scan backup restore-test patch-window report; do
   systemctl enable --now "host-guard-$t.timer" >/dev/null
 done
 systemctl enable host-guard-boot.service host-guard-firewall.service >/dev/null

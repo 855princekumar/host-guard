@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
   workflow_call:      # the release runs all of it before publishing
+  schedule:
+    - cron: '23 1 * * *'   # nightly: everything again against today's images and feeds, longer fuzzing, ZAP
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -29,6 +32,8 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: pip install pytest==8.4.2
       - run: python -m pytest -q tests guard/tests panel/tests
+        env:
+          FUZZ_N: ${{ github.event_name == 'schedule' && '5000' || '300' }}
 
   lint:
     name: Lint (ruff)
@@ -126,6 +131,8 @@ jobs:
           name: dist
           path: dist
       - run: bash ci/redteam/run.sh
+        env:
+          ZAP: ${{ github.event_name == 'schedule' && '1' || '0' }}   # OWASP ZAP baseline of the panel, nightly
       - if: always()
         run: cat redteam-out/REPORT.md >> "$GITHUB_STEP_SUMMARY"
       - if: always()

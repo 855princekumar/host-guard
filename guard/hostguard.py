@@ -27,6 +27,11 @@ when empty (docs/CONFIGURATION.md); examples/profiles/ has ready combinations.
     hostguard boot           after every boot: a mail, with the health check
     hostguard export         every minute (with the panel): a status file without secrets
                              for the web panel, which runs unprivileged
+    hostguard shield         every 6 h: advisories (inventory against official sources);
+                             hostguard findings | hold ID | fix ID | ignore ID | undo | sources
+    hostguard replies        every 2 min (REPLY_ACTIONS=on): act on admins' replies to
+                             host-guard's mail (fix, hold, reboot; docs/APPROVALS.md)
+    hostguard approvals      what waits for an admin's approval, and who approved what, how
     hostguard test-mail | status | unlock
 
 Bans (SSH, repeat offenders, and with web logs sign-in floods and probes) are
@@ -102,6 +107,14 @@ DEFAULTS = {
                                     # as Markdown); empty: pages are read directly. Never used for official sources.
     'SOURCES_MAX': '20',            # sources the admins may add
     'SHIELD_PATH': '/usr/local/lib/host-guard/shield.py',
+    # approvals by reply (docs/APPROVALS.md): off | on. Replies are read from the sending
+    # account's inbox over IMAP; only the mail server's own DMARC verdict for an admin address
+    # counts, and a reply only names one action with the single-use code host-guard mailed
+    'REPLY_ACTIONS': 'off', 'IMAP_HOST': 'imap.gmail.com', 'IMAP_PORT': '993', 'IMAP_USER': '',
+    'REPLY_AUTHSERV': 'mx.google.com',   # who stamps Authentication-Results in that inbox
+    'IMAP_CA': '',                       # a CA file for a mail server with its own certificate
+    'REPLY_TTL_H': '24',                 # hours a code in a mail works
+    'REBOOT_APPROVALS': '2', 'FIX_APPROVALS': '1',   # different admins needed (never more than there are)
     # the panel's sign-in: who may get a code (empty: every MAIL_TO address), where the panel
     # leaves its requests, and the panel's own user (only its files are read)
     'PANEL_ADMINS': '', 'PANEL_OUTBOX': '/var/lib/host-guard-panel/outbox', 'PANEL_USER': 'hgpanel',
@@ -113,7 +126,7 @@ DEFAULTS = {
     'PRICE_S3_GB_MONTH': '0.025',
 }
 SECRETS = ('SMTP_PASSWORD', 'BACKUP_PASSPHRASE', 'EDGESHELL_KEY', 'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY',
-           'BACKUP_REMOTE_URL', 'NVD_API_KEY', 'READER_KEY')
+           'BACKUP_REMOTE_URL', 'NVD_API_KEY', 'READER_KEY', 'IMAP_PASSWORD')
 REGIONS = {'ap-south-1': 'Asia Pacific (Mumbai)', 'ap-south-2': 'Asia Pacific (Hyderabad)',
            'ap-southeast-1': 'Asia Pacific (Singapore)', 'us-east-1': 'US East (N. Virginia)',
            'us-west-2': 'US West (Oregon)', 'eu-west-1': 'EU (Ireland)', 'eu-central-1': 'EU (Frankfurt)'}
@@ -348,7 +361,7 @@ CATEGORIES = ('Intrusion', 'Attack', 'Host change', 'Advisory', 'Backup', 'Healt
               'Test', 'Sign-in')
 # Never held by flood protection: signs of someone on the server. Holding them would let an
 # intruder bury the alert that matters under a few noisy ones (red-team HOST-9).
-NEVER_HELD = ('Intrusion', 'Host change', 'Daily report', 'Test', 'Sign-in')   # a held sign-in code is useless
+NEVER_HELD = ('Intrusion', 'Host change', 'Daily report', 'Test', 'Sign-in', 'Approval')   # a held sign-in code is useless
 KEY_CATEGORY = {'memory': 'Health', 'disk': 'Health', 'containers': 'Health', 'https': 'Health', 'cert': 'Health',
                 'replication': 'Health', 'backup': 'Backup', 'backup-upload': 'Backup', 'backup-failed': 'Backup',
                 'reboot': 'Updates'}
@@ -595,7 +608,8 @@ def _checks():
     if os.path.exists('/var/run/reboot-required'):
         pk = open('/var/run/reboot-required.pkgs').read().split() if os.path.exists('/var/run/reboot-required.pkgs') else []
         res.append(('reboot', True, 'Reboot needed after security updates',
-                    'Packages: ' + ' '.join(pk[:20]) + '\nIt happens in the maintenance window after a backup.'))
+                    'Packages: ' + ' '.join(pk[:20]) + '\nIt happens in the maintenance window after a backup.'
+                    + _reboot_offer()))
     else:
         res.append(('reboot', False, '', ''))
     return res
@@ -1404,6 +1418,33 @@ def patch_window():
     sh('systemctl reboot', 30)
 
 
+def _reboot_offer():
+    """The reply line for "reboot now", when replies are on (never stops the health check)."""
+    if C['REPLY_ACTIONS'] != 'on':
+        return ''
+    try:
+        return approvals_module().offer_text(this(), [('reboot', 'now', 'reboot now for the security updates')])
+    except Exception as e:
+        print(f'health: no reboot reply code ({e})')
+        return ''
+
+
+def approved_reboot(by):
+    """A reboot that admins approved (by mail, on the dashboard): a backup first, as in the
+    maintenance window, and not while data lake replication is broken. Returns (ok, what)."""
+    ok, detail = replication()
+    if ok is False:
+        return False, f'not rebooted: data lake replication is not healthy ({detail})'
+    backup()
+    s = load()
+    s['planned_reboot'] = {'at': now(), 'packages': [], 'by': by}
+    save(s)
+    mail(category='Updates', level='alert', subject='Rebooting now: approved by admins',
+         body=f'Approved by {by}. A fresh backup was taken first. You get a mail when the server is back, with its health.')
+    rc, out_ = sh('systemctl reboot', 30)
+    return rc == 0, 'rebooting' if rc == 0 else f'systemctl reboot failed: {out_[:200]}'
+
+
 def boot():
     time.sleep(int(os.environ.get('HG_BOOT_WAIT', '90')))
     s = load()
@@ -1985,6 +2026,28 @@ def export_sources():
         return []
 
 
+def export_advisories():
+    """Open Critical and Moderate findings for the panel's Advisories page (ids, no plans)."""
+    try:
+        known = load('shield.json').get('known', {})
+        rows = [{'id': k, 'tier': v['tier'], 'status': v['status'], 'name': v['name'], 'where': v['where'],
+                 'vuln': v['vuln'], 'fixable': bool(v.get('plan')), 'due': v.get('due'), 'held_by': v.get('held_by', '')}
+                for k, v in known.items() if v.get('status') in ('open', 'held', 'not applied', 'rolled back')
+                and v.get('tier') in ('Critical', 'Moderate')]
+        return sorted(rows, key=lambda r: (r['tier'] != 'Critical', r['name']))[:60]
+    except Exception as e:
+        print(f'export: advisories not listed ({e})')
+        return []
+
+
+def export_approvals():
+    try:
+        return approvals_module().export(this())
+    except Exception as e:
+        print(f'export: approvals not listed ({e})')
+        return {'waiting': [], 'log': []}
+
+
 def export():
     """Write what the panel shows (no secrets) to EXPORT_FILE, readable by the panel's group.
     The panel runs unprivileged and never reads host-guard's own state or .env."""
@@ -1994,7 +2057,9 @@ def export():
             **{k: s.get(k) for k in STATUS_KEYS},
             'open_problems': [{'key': k, 'subject': v.get('subject', ''), 'at': v.get('at')}
                               for k, v in sorted(load('alerts.json').items())],
-            'mails': load('mail-log.json').get('sent', [])[-30:], 'sources': export_sources()}
+            'mails': load('mail-log.json').get('sent', [])[-30:], 'sources': export_sources(),
+            'advisories': export_advisories(), 'approvals': export_approvals(),
+            'reboot_needed': os.path.exists('/var/run/reboot-required')}
     data = scrub(json.loads(json.dumps(data, default=str)), [C[k] for k in SECRETS if len(C[k]) >= 6])
     os.makedirs(os.path.dirname(target), exist_ok=True)
     tmp = target + '.tmp'
@@ -2150,6 +2215,26 @@ def _panel_outbox(dfd, uid):
                  'sudo -u hgpanel python3 /usr/local/lib/host-guard-panel/hgpanel.py audit')
             told.append({'at': now(), 'email': email})
             done += 1
+        elif kind == 'approve':
+            # fix / hold / reboot, confirmed on the dashboard with a fresh mailed code; root still
+            # decides: a known action only, 10 changes an hour, the approvals rules (a reboot
+            # needs two admins), every result mailed to every admin
+            if len(changes) >= 10:
+                refused += 1
+                print(f'panel-outbox: approval by {email} not taken (10 an hour)')
+                continue
+            changes.append({'at': now(), 'email': email})
+            ok, msg = approvals_module().approve(this(), str(data.get('verb', '')), str(data.get('target', '')),
+                                                 email, 'dashboard')
+            if ok and 'another admin' not in msg:
+                mail(subject=f'Approved on the dashboard: {data.get("verb")} {data.get("target")} ({email})',
+                     category='Approval', level='alert', body=f'{email} approved it on the dashboard.\nResult: {msg}\n\n'
+                     'Every approval is in the log:  sudo hostguard approvals')
+            elif not ok:
+                mail(subject='Dashboard approval not taken', category='Approval', level='info', to=[email],
+                     body=f'Your approval did nothing: {msg}')
+            done += 1
+            exported = True
         elif kind in ('source-add', 'source-remove'):
             # an admin confirmed it with a mailed code on the dashboard; a taken-over panel could
             # skip that, so root still decides: context sources only, public https only, at most
@@ -2193,7 +2278,9 @@ def test_mail():
 COMMANDS = {'health': health, 'cost': cost, 'watch': watch, 'feeds': feeds, 'scan': scan, 'backup': backup,
             'restore-test': restore_test, 'patch-window': patch_window, 'boot': boot, 'report': report,
             'status': status, 'test-mail': test_mail, 'unlock': unlock, 'export': export, 'whereami': whereami,
-            'panel-outbox': lambda: panel_outbox(), 'shield': lambda: shield_module().run(this())}
+            'panel-outbox': lambda: panel_outbox(), 'shield': lambda: shield_module().run(this()),
+            'replies': lambda: sys.exit(approvals_module().poll(this())),
+            'approvals': lambda: print('\n'.join(approvals_module().lines(this())))}
 SHIELD_CLI = ('inventory', 'findings', 'hold', 'ignore', 'fix', 'undo', 'sources')
 
 
@@ -2205,10 +2292,19 @@ def this():
 
 def shield_module():
     """guard/shield.py, installed next to this file's libraries (loaded only when used)."""
+    return _lib('shield')
+
+
+def approvals_module():
+    """guard/approvals.py: approvals by reply, on the dashboard and on the console."""
+    return _lib('approvals')
+
+
+def _lib(name):
     import importlib.util
-    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'shield.py')
-    path_ = here if os.path.exists(here) else C['SHIELD_PATH']
-    spec = importlib.util.spec_from_file_location('hostguard_shield', path_)
+    here = os.path.join(os.path.dirname(os.path.abspath(__file__)), f'{name}.py')
+    path_ = here if os.path.exists(here) else os.path.join(os.path.dirname(C['SHIELD_PATH']), f'{name}.py')
+    spec = importlib.util.spec_from_file_location(f'hostguard_{name}', path_)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
