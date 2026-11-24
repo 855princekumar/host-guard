@@ -339,3 +339,12 @@ def test_without_a_fix_a_finding_is_low_unless_it_is_exploited(sh):
     assert sh.tier(9.8, False, None, False, 'host', fixable=True) == 'Moderate'     # installed, not running
     assert sh.tier(5.5, False, 0.2, True, 'host', fixable=True) == 'Moderate'
     assert sh.tier(5.5, False, 0.01, True, 'host', fixable=True) == 'Low'
+
+
+def test_loading_the_advisories_leaves_no_bytecode_beside_them(hg):
+    cache = os.path.join(os.path.dirname(os.path.abspath(hg.__file__)), '__pycache__')
+    before = set(os.listdir(cache)) if os.path.isdir(cache) else set()
+    hg.shield_module()
+    hg.approvals_module()
+    after = set(os.listdir(cache)) if os.path.isdir(cache) else set()
+    assert not {n for n in after - before if n.startswith(('shield.', 'approvals.'))}

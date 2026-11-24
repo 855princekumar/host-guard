@@ -58,6 +58,9 @@
   the code was ignored before (nothing was ever run); now the line is refused as not understood.
 
 ### Fixed
+- Loading the advisories wrote Python bytecode (`__pycache__`) beside the installed files, so a
+  rollback was no longer exact and an uninstall left files behind. No bytecode is written there now
+  (found by the install, upgrade, rollback and uninstall test).
 - Found by the new fuzzer before release: a reply whose headers the mail parser could not read
   raised an exception. Left unread in the inbox, one such mail would have stopped every reply
   behind it. Now it is refused and logged, and the rest go on.

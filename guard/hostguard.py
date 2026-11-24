@@ -2388,6 +2388,7 @@ def _lib(name):
     path_ = here if os.path.exists(here) else os.path.join(os.path.dirname(C['SHIELD_PATH']), f'{name}.py')
     spec = importlib.util.spec_from_file_location(f'hostguard_{name}', path_)
     mod = importlib.util.module_from_spec(spec)
+    sys.dont_write_bytecode = True     # no __pycache__ beside the installed files: rollback and purge stay exact
     spec.loader.exec_module(mod)
     return mod
 
