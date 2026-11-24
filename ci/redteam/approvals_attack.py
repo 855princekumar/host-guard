@@ -12,6 +12,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
@@ -52,7 +53,7 @@ mail_location = maildir:~/Maildir
 EOF
 id guardmail >/dev/null 2>&1 || useradd -m guardmail
 echo 'guardmail:Rt-Imap-Pass-4821' | chpasswd
-dovecot
+dovecot </dev/null >/dev/null 2>&1
 '''
 r = run(setup)
 cfg = (f'REPLY_ACTIONS=on\nIMAP_HOST=localhost\nIMAP_PORT=993\nIMAP_USER={USER}\nIMAP_CA={CA}\n'
@@ -125,6 +126,49 @@ def mailbox():
         return ''
 
 
+def as_panel(items):
+    """Write outbox files exactly as the panel's own user can (what a taken-over panel could do)."""
+    t = time.time()
+    script = ' ; '.join(f"printf '%s' '{json.dumps(dict(x, at=t))}' > {OUTBOX}/{int(t * 1000) + i}-{os.urandom(8).hex()}.json"
+                        for i, x in enumerate(items))
+    subprocess.run(['runuser', '-u', 'hgpanel', '--', 'sh', '-c', script], capture_output=True)
+
+
+def wait(pred, n=60):
+    for _ in range(n):
+        if pred():
+            return True
+        time.sleep(1)
+    return pred()
+
+
+def mailed_code(to, before):
+    """The change code root mailed to `to` after mailbox offset `before` (what the admin reads)."""
+    for part in reversed(mailbox()[before:].split('=== MAIL to ')[1:]):
+        head, _, body = part.partition('\n')
+        m = re.search(r'Code: ([0-9]{6})', body)
+        if to in head and 'confirm a dashboard change' in body and m:
+            return m.group(1)
+    return ''
+
+
+def dashboard(email, change):
+    """The real two-step dashboard flow: ask root for a code, read it from the mailbox, confirm."""
+    cid, before = os.urandom(16).hex(), len(mailbox())
+    as_panel([{'kind': 'change-request', 'email': email, 'cid': cid, 'change': change}])
+    wait(lambda: mailed_code(email, before), 30)
+    c = mailed_code(email, before)
+    if c:
+        as_panel([{'kind': 'confirm', 'email': email, 'cid': cid, 'code': c}])
+    return cid, c
+
+
+# The panel stage just before signed in as admin2 again and again and used up its 5 mailed codes in
+# 15 minutes (that limit is tested there). This stage starts a fresh quarter-hour, as if later.
+pm = hg.load('panel-mail.json')
+pm['sent'] = []
+hg.save(pm, 'panel-mail.json')
+
 check('MAIL-0', 'T1078', 'The reply reader logs in to a real IMAP server over TLS (its own certificate, IMAP_CA)',
       'it reads the inbox', 'replies: 0 read' in run('hostguard replies').stdout,
       (r.stderr or 'dovecot up')[-200:])
@@ -188,40 +232,43 @@ reboot = code('reboot', 'now')
 before = len(mailbox())
 deliver(ADMIN, f'REBOOT {reboot}', [stamp()])
 one = 'planned_reboot' not in hg.load() and 'Approval 1 of 2: reboot now' in mailbox()[before:]
-t = time.time()
-subprocess.run(['runuser', '-u', 'hgpanel', '--', 'sh', '-c',
-                f"printf '%s' '{json.dumps({'kind': 'approve', 'email': ADMIN2, 'verb': 'reboot', 'target': 'now', 'at': t})}' "
-                f"> {OUTBOX}/{int(t * 1000)}-{os.urandom(8).hex()}.json"], capture_output=True)
-for _ in range(60):
-    if hg.load().get('planned_reboot'):
-        break
-    time.sleep(1)
+_, code8 = dashboard(ADMIN2, {'action': 'approve', 'verb': 'reboot', 'target': 'now'})
+wait(lambda: hg.load().get('planned_reboot'))
 pr = hg.load().get('planned_reboot') or {}
 check('MAIL-8', 'T1529', 'A reboot approved by one admin by mail', 'nothing until a second admin approves (here on the '
-      'dashboard); then a backup and the reboot, naming both and how',
+      'dashboard, with the code root mailed); then a backup and the reboot, naming both and how',
       one and ADMIN in pr.get('by', '') and ADMIN2 in pr.get('by', '') and 'dashboard' in pr.get('by', ''),
-      f'after one: not rebooted={one}; after two: {pr.get("by", "not rebooted")}')
+      f'after one: not rebooted={one}; code mailed: {bool(code8)}; after two: {pr.get("by", "not rebooted")}')
 
-# 9: a taken-over panel feeds root approvals it never confirmed with a code
+# 9: a taken-over panel: the old direct kinds, a change it confirms with guessed codes, and an
+#    inside source an admin really confirms (the root side still refuses the address)
 st = hg.load('shield.json')
 st['known'][FID]['status'] = 'open'
 hg.save(st, 'shield.json')
-t = time.time()
-items = [{'kind': 'approve', 'email': OUTSIDER, 'verb': 'hold', 'target': FID},
-         {'kind': 'approve', 'email': ADMIN, 'verb': 'shell', 'target': FID},
-         {'kind': 'approve', 'email': ADMIN, 'verb': 'fix', 'target': '../../etc'},
-         {'kind': 'source-add', 'email': ADMIN, 'name': 'Inside', 'url': 'https://floci:4566/', 'fmt': 'page'}]
-script = ' ; '.join(f"printf '%s' '{json.dumps(dict(x, at=t))}' > {OUTBOX}/{int(t * 1000) + i}-{os.urandom(8).hex()}.json"
-                    for i, x in enumerate(items))
 before = len(mailbox())
-subprocess.run(['runuser', '-u', 'hgpanel', '--', 'sh', '-c', script], capture_output=True)
+as_panel([{'kind': 'approve', 'email': ADMIN, 'verb': 'hold', 'target': FID},
+          {'kind': 'approve', 'email': OUTSIDER, 'verb': 'hold', 'target': FID},
+          {'kind': 'approve', 'email': ADMIN, 'verb': 'shell', 'target': FID},
+          {'kind': 'approve', 'email': ADMIN, 'verb': 'fix', 'target': '../../etc'},
+          {'kind': 'source-add', 'email': ADMIN, 'name': 'Inside', 'url': 'https://floci:4566/', 'fmt': 'page'}])
 time.sleep(6)
+direct = status() == 'open'
+cid = os.urandom(16).hex()
+as_panel([{'kind': 'change-request', 'email': ADMIN, 'cid': cid, 'change': {'action': 'approve', 'verb': 'hold', 'target': FID}}])
+time.sleep(4)
+as_panel([{'kind': 'confirm', 'email': ADMIN, 'cid': cid, 'code': g} for g in ('000000', '123456', '999999', '111111', '424242')])
+time.sleep(6)
+guessed = status() == 'open'
+_, code23 = dashboard(ADMIN, {'action': 'add', 'name': 'Inside', 'url': 'https://floci:4566/', 'fmt': 'page'})
+wait(lambda: 'not a public address' in mailbox()[before:], 60)
 new = mailbox()[before:]
 extra = [s['url'] for s in hg.load('shield.json').get('extra_sources', [])]
-check('PANEL-23', 'T1068', "The panel's own user (if the panel were taken over) feeds root approvals: for an outsider, an "
-      'unknown action, a path as target, and an advisory source inside the network (SSRF to an internal service)',
-      'nothing done, no internal address added', status() == 'open' and 'https://floci:4566/' not in extra
-      and 'not a public address' in new, f'finding {status()}; sources added: {extra or "none"}')
+check('PANEL-23', 'T1068', "The panel's own user (if the panel were taken over) writes root approvals and source changes "
+      'directly, confirms a hold with guessed codes, and an admin confirms an advisory source inside the network (SSRF)',
+      'direct writes and guesses do nothing; the inside source is refused by root and the admin told',
+      direct and guessed and status() == 'open' and 'https://floci:4566/' not in extra and 'not a public address' in new,
+      f'direct refused: {direct}; guesses refused: {guessed}; real code mailed: {bool(code23)}; '
+      f'finding {status()}; sources added: {extra or "none"}')
 
 # 10: other mail in the inbox is left alone
 deliver('friend@example.net', 'Lunch on Friday?', [stamp('example.net')], subject='Lunch')

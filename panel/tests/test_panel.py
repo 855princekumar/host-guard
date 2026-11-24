@@ -344,49 +344,50 @@ def change(c, **form):
     return c.req('POST', '/sources/change', dict({'csrf': c.form_csrf}, **form))
 
 
-def test_adding_a_source_needs_a_fresh_code_that_names_the_change(hp):
+def test_adding_a_source_asks_root_for_a_code_and_passes_the_admins_code_on(hp):
     c = Client(hp)
     assert c.login().status == 303
     outbox(hp)
     r = change(c, action='add', name='Example News', url='https://news.example/feed', fmt='feed')
     assert r.status == 200 and 'Confirm: <b>add the feed' in r.text
     items = outbox(hp)
-    assert [(x['kind'], x['purpose']) for x in items] == [('code', 'confirm')]
-    assert 'Example News' in items[0]['summary'] and items[0]['email'] == ADMIN
-    r = c.req('POST', '/sources/confirm', {'csrf': c.form_csrf, 'code': items[0]['code']})
-    assert r.status == 200 and 'Sent to the server' in r.text
-    sent = outbox(hp)
-    assert [(x['kind'], x['name'], x['url'], x['fmt'], x['email']) for x in sent] == [
-        ('source-add', 'Example News', 'https://news.example/feed', 'feed', ADMIN)]
+    assert [(x['kind'], x['email'], x['change']) for x in items] == [
+        ('change-request', ADMIN, {'action': 'add', 'name': 'Example News', 'url': 'https://news.example/feed', 'fmt': 'feed'})]
+    assert 'code' not in items[0]                                           # the panel never sees the code
+    cid = items[0]['cid']
+    assert c.req('POST', '/sources/confirm', {'csrf': c.form_csrf, 'code': '12a456'}).status == 401
+    r = c.req('POST', '/sources/confirm', {'csrf': c.form_csrf, 'code': '123456'})
+    assert r.status == 200 and 'Sent to the server with your code' in r.text
+    assert [(x['kind'], x['cid'], x['code'], x['email']) for x in outbox(hp)] == [('confirm', cid, '123456', ADMIN)]
     events = [e for (e,) in hp.db().execute('SELECT event FROM audit')]
-    assert 'change code requested' in events and 'change confirmed' in events
-    r = c.req('POST', '/sources/confirm', {'csrf': c.form_csrf, 'code': items[0]['code']})
-    assert r.status == 401 and outbox(hp) == []                              # single use
+    assert 'change code requested' in events and 'change code entered' in events
 
 
-def test_a_change_code_works_only_in_the_session_that_asked_for_it(hp):
+def test_a_change_waits_only_in_the_session_that_asked_for_it(hp):
     a, b = Client(hp), Client(hp)
     a.login()
     b.login()
     outbox(hp)
     change(a, action='add', name='Mine', url='https://news.example/', fmt='page')
-    code = outbox(hp)[0]['code']
-    change(b, action='remove', id='mine')
     outbox(hp)
-    assert b.req('POST', '/sources/confirm', {'csrf': b.form_csrf, 'code': code}).status == 401
-    assert [x['kind'] for x in outbox(hp)] == []
-    assert a.req('POST', '/sources/confirm', {'csrf': a.form_csrf, 'code': code}).status == 200
+    b.req('GET', '/sources')
+    assert b.req('POST', '/sources/confirm', {'csrf': b.form_csrf, 'code': '123456'}).status == 401
+    assert outbox(hp) == []
+    assert a.req('POST', '/sources/confirm', {'csrf': a.form_csrf, 'code': '123456'}).status == 200
 
 
-def test_a_stolen_session_cannot_change_sources_without_the_mailbox(hp):
+def test_five_tries_per_change_and_five_changes_per_admin_in_ten_minutes(hp):
     c = Client(hp)
     c.login()
     outbox(hp)
-    change(c, action='add', name='Planted', url='https://attacker.example/', fmt='feed')
-    outbox(hp)                                                               # the code went to the admin, not here
-    for i in range(5):
+    change(c, action='add', name='Mine', url='https://news.example/', fmt='page')
+    for i in range(6):
         c.req('POST', '/sources/confirm', {'csrf': c.form_csrf, 'code': str(100000 + i)})
-    assert not [x for x in outbox(hp) if x['kind'].startswith('source-')]
+    assert [x['kind'] for x in outbox(hp)].count('confirm') == 5
+    for i in range(5):
+        change(c, action='remove', id=f'src-{i}')
+    assert change(c, action='remove', id='src-9').status == 400
+    assert [x['kind'] for x in outbox(hp)].count('change-request') == 4     # 5 in 10 minutes, the first included
 
 
 def test_source_changes_are_checked_and_need_the_session_token(hp):
@@ -433,10 +434,11 @@ def test_fix_now_needs_a_fresh_code_and_reaches_root_as_an_approval(hp):
     outbox(hp)
     r = approve(c, verb='fix', target='deadbeef', what='openssl 3.0.2: CVE-2026-1111')
     assert r.status == 200 and 'Confirm: <b>fix now finding deadbeef (openssl 3.0.2: CVE-2026-1111)' in r.text
-    code = outbox(hp)[0]['code']
-    r = c.req('POST', '/confirm', {'csrf': c.form_csrf, 'code': code})
+    req = outbox(hp)[0]
+    assert (req['kind'], req['change']) == ('change-request', {'action': 'approve', 'verb': 'fix', 'target': 'deadbeef'})
+    r = c.req('POST', '/confirm', {'csrf': c.form_csrf, 'code': '654321'})
     assert r.status == 200 and 'Open findings' in r.text
-    assert [(x['kind'], x['verb'], x['target'], x['email']) for x in outbox(hp)] == [('approve', 'fix', 'deadbeef', ADMIN)]
+    assert [(x['kind'], x['cid'], x['code'], x['email']) for x in outbox(hp)] == [('confirm', req['cid'], '654321', ADMIN)]
 
 
 def test_approvals_are_checked_before_any_code_is_sent(hp):

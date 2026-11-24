@@ -328,15 +328,51 @@ def vendor_fix(version, adv):
 VENDORS = {'nginx': ('nginx-org', parse_nginx_advisories)}
 
 
+CONTEXT_MAX = 1024 * 1024            # a context feed or page is read up to 1 MB
+ITEM_OPEN = re.compile(r'<(?:item|entry)\b')
+
+
+def _tag(low, text, name, pos=0, end=None):
+    """(open tag, body) of the first <name ...>...</name> in text[pos:end], found with str.find
+    only (linear: a hostile document cannot make it slow), or None."""
+    end = len(text) if end is None else end
+    i = low.find('<' + name, pos, end)
+    if i < 0:
+        return None
+    j = low.find('>', i, end)
+    if j < 0:
+        return None
+    if text[j - 1] == '/':
+        return text[i:j + 1], ''
+    k = low.find('</' + name, j, end)
+    return text[i:j + 1], text[j + 1:k if k >= 0 else j + 1]
+
+
 def rss_items(text):
-    """[(title, link)] from an RSS or Atom document, without an XML parser (nothing to expand)."""
-    items = []
-    for block in re.findall(r'<(?:item|entry)\b.*?</(?:item|entry)>', text, re.S | re.I)[:80]:
-        t = re.search(r'<title[^>]*>(.*?)</title>', block, re.S | re.I)
-        link = re.search(r'<link[^>]*href="([^"]+)"', block, re.I) or re.search(r'<link[^>]*>(.*?)</link>', block, re.S | re.I)
-        if t:
-            title = re.sub(r'<!\[CDATA\[|\]\]>|<[^>]+>', '', t.group(1)).strip()
-            items.append((re.sub(r'\s+', ' ', title)[:300], (link.group(1).strip() if link else '')[:400]))
+    """[(title, link)] from an RSS or Atom document, without an XML parser (nothing to expand)
+    and in linear time."""
+    text = text[:CONTEXT_MAX]
+    low = text.lower()
+    items, pos = [], 0
+    while len(items) < 80:
+        m = ITEM_OPEN.search(low, pos)
+        if not m:
+            break
+        ends = [e for e in (low.find('</item>', m.end()), low.find('</entry>', m.end())) if e >= 0]
+        if not ends:
+            break
+        stop = min(ends)
+        pos = stop + 1
+        t = _tag(low, text, 'title', m.end(), stop)
+        if not t:
+            continue
+        link = ''
+        lk = _tag(low, text, 'link', m.end(), stop)
+        if lk:
+            href = re.search(r'href="([^"]{1,400})"', lk[0])
+            link = href.group(1) if href else lk[1]
+        title = re.sub(r'<!\[CDATA\[|\]\]>|<[^<>]*>', '', t[1][:2000]).strip()
+        items.append((re.sub(r'\s+', ' ', title)[:300], link.strip()[:400]))
     return items
 
 
@@ -346,6 +382,7 @@ MD_LINK = re.compile(r'\[([^\]\n]{8,300})\]\((https?://[^)\s]{1,400})\)')
 def page_items(text, url):
     """[(title, link)] from a web page read as Markdown (a reader) or as plain text: the
     links and headings, each line once; a line without its own link points at the page."""
+    text = text[:CONTEXT_MAX]
     items, seen = [], set()
     for title, link in MD_LINK.findall(text):
         t = re.sub(r'[*_`#>]+', '', title).strip()
@@ -1189,6 +1226,7 @@ def describe(f, with_fix=True):
 def run(hg):
     """The run every 6 hours (host-guard-shield.timer): inventory, findings, mails by tier, fixes that are due."""
     state = hg.load('shield.json')
+    at_start = {k: v.get('status') for k, v in state.get('known', {}).items()}
     first = 'known' not in state
     inv = inventory(hg)
     findings = check(hg, inv, state)
@@ -1211,6 +1249,7 @@ def run(hg):
         known[k]['gone_at'] = t
     for k in [k for k, v in known.items() if v.get('status') in ('gone', 'ignored', 'fixed') and t - v.get('last', t) > 30 * 86400]:
         known.pop(k)
+    _keep_admin_changes(hg, known, at_start)
     suggestions = learn_sources(state, findings)
     state['last'] = {'at': t, 'components': len(inv['components']), 'containers': len(inv['containers']),
                      'not_covered': inv['not_covered'][:30], 'notes': inv['notes'],
@@ -1230,6 +1269,23 @@ def run(hg):
     fixes = due_fixes(hg, state)
     print(f'shield: {len(inv["components"])} components in {1 + len(inv["containers"])} places; '
           + ', '.join(f'{n} {x.lower()}' for x, n in state['last']['tiers'].items()) + f'; {len(new)} new; {len(fixes)} fixed')
+
+
+ADMIN_FIELDS = ('status', 'held_by', 'held_at', 'reason', 'ignored_at', 'fixes', 'due')
+
+
+def _keep_admin_changes(hg, known, at_start):
+    """A run takes minutes; an admin may hold, fix or ignore a finding meanwhile (by reply, on
+    the dashboard, on the console). What they did wins over this run's older copy."""
+    now_ = hg._read('shield.json').get('known', {})
+    for k, v in known.items():
+        cur = now_.get(k)
+        if cur and k in at_start and cur.get('status') != at_start[k]:
+            for f in ADMIN_FIELDS:
+                if f in cur:
+                    v[f] = cur[f]
+                else:
+                    v.pop(f, None)
 
 
 def _baseline_body(inv, findings, state, hold_h, hg):
@@ -1309,6 +1365,12 @@ def due_fixes(hg, state, only=None, force=False, by=''):
             continue
         if not force and (hg.C['AUTO_FIX'] != 'critical' or time.time() < v.get('due', float('inf'))
                           or not in_window(hg.C['FIX_WINDOW'])):
+            continue
+        cur = hg._read('shield.json').get('known', {}).get(k, {})
+        if cur.get('status') and cur['status'] != v['status']:      # an admin acted meanwhile: theirs wins
+            for f in ADMIN_FIELDS:
+                if f in cur:
+                    v[f] = cur[f]
             continue
         f = {'fid': k, 'vuln': v['vuln'], 'title': v['text'].splitlines()[1].strip() if '\n' in v['text'] else v['vuln'],
              'tier': v['tier'], 'comp': {'name': v['name'].split(' ')[0], 'version': v['name'].split(' ', 1)[-1], 'where': v['where']}}

@@ -130,13 +130,16 @@ sequenceDiagram
   server.
 
 A button never acts by itself:
-1. The panel mails the admin a code naming that one change (*Your code to confirm a dashboard
-   change*).
-2. Only that code, in that session, sends it on.
-3. Root then checks it again: a known action, an admin, at most 10 changes an hour, and two
+1. The panel only asks root.
+2. Root mails the admin a code. Root made the code, the panel never sees it, and it is bound
+   to that admin and exactly that change, which the mail names in root's own words (*Your code
+   to confirm a dashboard change*).
+3. The admin types it on the dashboard, and the panel passes it to root.
+4. Root makes the change only when the code matches: 5 tries, 10 changes an hour, and two
    admins for a reboot.
 
-A stolen session cookie alone changes nothing.
+A stolen session cookie, or even a taken-over panel process, changes nothing without the
+admin's mailbox.
 
 ## Settings
 

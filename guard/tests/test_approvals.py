@@ -6,6 +6,7 @@ approval and refusal is logged with who and the channel (email, dashboard, conso
 import importlib.util
 import json
 import os
+import re
 import sys
 import time
 
@@ -167,6 +168,15 @@ def test_nothing_else_in_a_reply_is_ever_run(hg, ap, line):
     assert ap.handle(hg, reply('sec@example.com', line))[0] == 'refused'
 
 
+@pytest.mark.parametrize('extra', ['; touch /tmp/x', ' && reboot', ' $(id)', ' please', ' hg-aaaaaaaaaaaaaaaaaaaaaaaaaa'])
+def test_an_action_line_with_anything_after_the_code_does_nothing(hg, ap, extra):
+    tok = codes(hg, ap, 'hold')
+    assert ap.handle(hg, reply('sec@example.com', f'HOLD {tok}{extra}'))[0] == 'refused'
+    assert hg.load('shield.json')['known']['deadbeef']['status'] == 'open'
+    assert ap.handle(hg, reply('sec@example.com', f'  hold {tok}. '))[0] != 'refused'   # the code still works alone
+    assert hg.load('shield.json')['known']['deadbeef']['status'] == 'held'
+
+
 # ---------------------------------------------------------------- two admins for a reboot
 def test_a_reboot_needs_two_different_admins_on_any_channel(hg, ap, monkeypatch):
     done = []
@@ -198,18 +208,45 @@ def test_the_dashboard_approval_goes_through_root_only_for_admins(hg, ap, tmp_pa
     box.mkdir(mode=0o700)
     os.chmod(box, 0o700)
     hg.C.update(PANEL_OUTBOX=str(box), PANEL_USER=pwd.getpwuid(os.getuid()).pw_name)
-    for who in ('evil@example.org', 'sec@example.com'):
+
+    def drop(d):
         t = time.time()
-        (box / f'{int(t * 1000)}-{os.urandom(8).hex()}.json').write_text(json.dumps(
-            {'kind': 'approve', 'email': who, 'verb': 'hold', 'target': 'deadbeef', 'at': t}))
+        (box / f'{int(t * 1000)}-{os.urandom(8).hex()}.json').write_text(json.dumps(dict(d, at=t)))
         hg.panel_outbox()
+
+    for who in ('evil@example.org', 'sec@example.com'):
+        cid = os.urandom(16).hex()
+        drop({'kind': 'change-request', 'email': who, 'cid': cid,
+              'change': {'action': 'approve', 'verb': 'hold', 'target': 'deadbeef'}})
+        found = re.findall(r'Code: (\d{6})', mails(hg))
+        drop({'kind': 'confirm', 'email': who, 'cid': cid, 'code': found[-1] if found else '000000'})
         if who.startswith('evil'):
-            assert hg.load('shield.json')['known']['deadbeef']['status'] == 'open'
+            assert hg.load('shield.json')['known']['deadbeef']['status'] == 'open' and not found
     assert hg.load('shield.json')['known']['deadbeef']['status'] == 'held'
+    assert 'hold the automatic fix of openssl 3.0.2 on host, CVE-2026-1111 (finding deadbeef)' in mails(hg)
     assert log(hg)[-1]['channel'] == 'dashboard' and log(hg)[-1]['by'] == 'sec@example.com'
     exported = json.load(open(hg.C['EXPORT_FILE']))
     assert exported['approvals']['log'][-1]['channel'] == 'dashboard'
     assert all('nonce' not in w for w in exported['approvals']['waiting'])
+
+
+# audit 0.5.0, finding 6: a DMARC verdict read outside the dmarc result, and an address inside an encoded word
+@pytest.mark.parametrize('ar', [
+    'mx.google.com; spf=pass smtp.mailfrom="x dmarc=pass header.from=example.com y"@evil.test; '
+    'dmarc=fail header.from=example.com',
+    'mx.google.com; spf=pass smtp.mailfrom="a; dmarc=pass header.from=example.com; b"@evil.test; dmarc=fail header.from=example.com',
+    'mx.google.com; dkim=pass (dmarc=pass header.from=example.com) header.d=evil.test; dmarc=fail header.from=example.com',
+    'mx.google.com; dmarc=pass header.from=example.com; dmarc=fail header.from=example.com',
+])
+def test_only_the_dmarc_result_itself_counts(hg, ap, ar):
+    tok = codes(hg, ap, 'hold')
+    assert ap.handle(hg, reply('sec@example.com', f'HOLD {tok}', ar=ar))[0] == 'refused'
+
+
+def test_an_address_inside_an_encoded_word_is_refused(hg, ap):
+    tok = codes(hg, ap, 'hold')
+    raw = reply('sec@example.com', f'HOLD {tok}').replace(b'From: Someone <sec@example.com>', b'From: =?utf-8?q?sec=40example.com?=')
+    assert ap.handle(hg, raw) == ('refused', 'not an admin')
 
 
 def test_the_console_is_logged_too(hg, ap, monkeypatch):
@@ -224,6 +261,7 @@ def test_the_console_is_logged_too(hg, ap, monkeypatch):
 class FakeImap:
     def __init__(self, msgs):
         self.msgs, self.seen, self.logged = msgs, set(), None
+        self.untagged_responses = {'UIDVALIDITY': [b'7']}
 
     def login(self, u, p):
         self.logged = (u, p)
@@ -233,7 +271,8 @@ class FakeImap:
 
     def uid(self, cmd, *args):
         if cmd == 'SEARCH':
-            return 'OK', [b' '.join(k for k in self.msgs if k not in self.seen)]
+            lo = int(args[2].split(':')[0]) if args[1] == 'UID' else 1
+            return 'OK', [b' '.join(k for k in self.msgs if int(k) >= lo)]
         if cmd == 'FETCH' and args[1] == '(RFC822.SIZE)':
             return 'OK', [b'1 (UID %s RFC822.SIZE %d)' % (args[0], len(self.msgs[args[0]]))]
         if cmd == 'FETCH':
@@ -244,6 +283,20 @@ class FakeImap:
 
     def logout(self):
         pass
+
+
+# audit 0.5.0, finding 5: 50 newer mails hid an admin's reply for two days
+def test_newer_mail_never_hides_a_reply(hg, ap):
+    hg.C['SMTP_PASSWORD'] = 'app-password-x'
+    hg.C['MAIL_FROM'] = 'guard@example.com'
+    tok = codes(hg, ap, 'hold')
+    msgs = {str(i).encode(): b'From: a@b.example\r\nSubject: news\r\n\r\nhello\r\n' for i in range(1, 61)}
+    im = FakeImap(msgs)
+    ap.poll(hg, imap=im)                                                    # reads 1..50
+    msgs[b'61'] = reply('sec@example.com', f'HOLD {tok}')
+    ap.poll(hg, imap=im)                                                    # 51..61, the reply among them
+    assert hg.load('shield.json')['known']['deadbeef']['status'] == 'held'
+    assert hg.load('approvals.json')['imap'] == {'validity': '7', 'last': 61}
 
 
 def test_poll_acts_on_host_guard_replies_and_leaves_other_mail_alone(hg, ap):

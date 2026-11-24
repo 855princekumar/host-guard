@@ -56,6 +56,7 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import socket
@@ -954,10 +955,31 @@ def read_page(url, public_only=False):
                             headers={'Authorization': f'Bearer {C["READER_KEY"]}'} if C['READER_KEY'] else None)
         except Exception as e:                      # the reader down or over its limit: read it directly
             print(f'reader failed for {url[:80]} ({str(e)[:80]}); reading it directly')
-    html_ = get_text(url, public_only=public_only)
-    html_ = re.sub(r'(?is)<(script|style|noscript)\b.*?</\1>', ' ', html_)
+    html_ = get_text(url, public_only=public_only)[:1024 * 1024]
+    html_ = _drop_blocks(html_)
     html_ = re.sub(r'(?i)<br\s*/?>|</(p|div|li|h[1-6]|tr|article|section)>', '\n', html_)
-    return html.unescape(re.sub(r'<[^>]+>', ' ', html_))
+    return html.unescape(re.sub(r'<[^<>]*>', ' ', html_))
+
+
+BLOCK_OPEN = re.compile(r'<(script|style|noscript)\b')
+
+
+def _drop_blocks(h):
+    """h without its script, style and noscript blocks, in linear time (an unclosed one ends
+    the page)."""
+    low, out, pos = h.lower(), [], 0
+    while True:
+        m = BLOCK_OPEN.search(low, pos)
+        if not m:
+            out.append(h[pos:])
+            break
+        out.append(h[pos:m.start()])
+        e = low.find('</' + m.group(1), m.end())
+        if e < 0:
+            break
+        g = low.find('>', e)
+        pos = g + 1 if g >= 0 else len(h)
+    return ' '.join(out)
 
 
 TEXT_MAX = 20 * 1024 * 1024
@@ -2078,6 +2100,68 @@ def export():
 
 # ---------------------------------------------------------------- the panel's sign-in mails (root)
 OUTBOX_NAME = re.compile(r'^\d{10,16}-[0-9a-f]{16}\.json$')
+CHANGE_ID = re.compile(r'[0-9a-f]{32}')
+SOURCE_ID = re.compile(r'[a-z0-9][a-z0-9-]{0,39}')
+
+
+def change_summary(ch):
+    """Root's own words for a dashboard change (never the panel's), or '' when it is not one."""
+    if not isinstance(ch, dict):
+        return ''
+    a = ch.get('action')
+    if a == 'approve':
+        verb, target = str(ch.get('verb', '')), str(ch.get('target', ''))
+        if verb == 'reboot' and target == 'now':
+            return 'approve a reboot of the server now (a reboot needs two admins)'
+        if verb in ('fix', 'hold') and re.fullmatch(r'[0-9a-f]{8}', target):
+            v = load('shield.json').get('known', {}).get(target)
+            if not v:
+                return ''
+            return (f'{"fix now" if verb == "fix" else "hold the automatic fix of"} {v["name"]} on {v["where"]}, '
+                    f'{v["vuln"]} (finding {target})')
+        return ''
+    if a == 'add':
+        name, url, fmt = str(ch.get('name', '')), str(ch.get('url', '')), ch.get('fmt', 'feed')
+        if not name or len(name) > 80 or re.search(r'[\x00-\x1f\x7f]', name) or fmt not in ('feed', 'page'):
+            return ''
+        if not url.startswith('https://') or len(url) > 400 or re.search(r'[\s<>"\x00-\x1f\x7f]', url):
+            return ''
+        return f'add the {"web page" if fmt == "page" else "feed"} "{name}" at {url} as an advisory source'
+    if a == 'remove' and SOURCE_ID.fullmatch(str(ch.get('id', ''))):
+        return f'remove the advisory source {ch["id"]}'
+    return ''
+
+
+def change_code(cid, email, nonce, ch):
+    """The 6-digit code for one change of one admin, derived from root's key: the panel never
+    sees it, and it confirms only exactly this change."""
+    key = approvals_module()._key(this())
+    d = hmac.new(key, json.dumps([cid, email, nonce, ch], sort_keys=True).encode(), hashlib.sha256).digest()
+    return str(int.from_bytes(d[:8], 'big') % 10 ** 6).zfill(6)
+
+
+def _apply_change(ch, email):
+    """A dashboard change its admin confirmed with root's code."""
+    if ch['action'] == 'approve':
+        ok, msg = approvals_module().approve(this(), str(ch.get('verb', '')), str(ch.get('target', '')), email, 'dashboard')
+        if ok and 'another admin' not in msg:
+            mail(subject=f'Approved on the dashboard: {ch.get("verb")} {ch.get("target")} ({email})', category='Approval',
+                 level='alert', body=f'{email} approved it on the dashboard.\nResult: {msg}\n\n'
+                 'Every approval is in the log:  sudo hostguard approvals')
+        elif not ok:
+            mail(subject='Dashboard approval not taken', category='Approval', level='info', to=[email],
+                 body=f'Your approval did nothing: {msg}')
+        return
+    sh_ = shield_module()
+    st = load('shield.json')
+    by = f'{email} (on the dashboard)'
+    if ch['action'] == 'add':
+        ok, msg = sh_.add_source(this(), st, ch.get('name', ''), ch.get('url', ''), ch.get('fmt', 'feed'), by=by)
+    else:
+        ok, msg = sh_.remove_source(this(), st, str(ch.get('id', '')), by=by)
+    if not ok:
+        mail(subject='Dashboard change not made', category='Advisory', level='info', to=[email],
+             body=f'Your change was not made: {msg}')
 
 
 def panel_admins():
@@ -2148,6 +2232,7 @@ def _panel_outbox(dfd, uid):
     sent = [x for x in s.get('sent', []) if x.get('at', 0) > now() - 3600]
     told = [x for x in s.get('notices', []) if x.get('at', 0) > now() - 3600]
     changes = [x for x in s.get('changes', []) if x.get('at', 0) > now() - 3600]
+    pending = {k: v for k, v in s.get('pending', {}).items() if now() - v.get('at', 0) < 600}
     done = refused = 0
     exported = False
     for n in names:
@@ -2188,20 +2273,12 @@ def _panel_outbox(dfd, uid):
                 refused += 1
                 print(f'panel-outbox: code for {email} not sent (limit reached)')
                 continue
-            if data.get('purpose') == 'confirm':
-                what = re.sub(r'[\x00-\x1f\x7f]', ' ', str(data.get('summary', '')))[:300]
-                mail(subject='Your code to confirm a dashboard change', category='Sign-in', level='info', to=[email], body=
-                     f'Code: {data["code"]}\n\nIt confirms this change on the host-guard dashboard of {C["SITE"]}:\n\n'
-                     f'  {what}\n\nIt works once, for 10 minutes, in the session that asked for it.\n\n'
-                     'Not you? Someone is signed in as you: do not give anyone this code, sign out everywhere '
-                     '(sudo -u hgpanel python3 /usr/local/lib/host-guard-panel/hgpanel.py logout-all) and tell the other admins.')
-            else:
-                mail(subject='Your dashboard sign-in code', category='Sign-in', level='info', to=[email], body=
-                     f'Code: {data["code"]}\n\nIt works once, for 10 minutes, on the host-guard dashboard of {C["SITE"]}, '
-                     'in the browser that asked for it.\n\n'
-                     'Did you not ask for it? Someone who can reach the dashboard (it is only reachable through a '
-                     'tunnel to this server) entered your address. Nothing happens without the code. Tell the other '
-                     'admins, and look at the audit log: sudo -u hgpanel python3 /usr/local/lib/host-guard-panel/hgpanel.py audit')
+            mail(subject='Your dashboard sign-in code', category='Sign-in', level='info', to=[email], body=
+                 f'Code: {data["code"]}\n\nIt works once, for 10 minutes, on the host-guard dashboard of {C["SITE"]}, '
+                 'in the browser that asked for it.\n\n'
+                 'Did you not ask for it? Someone who can reach the dashboard (it is only reachable through a '
+                 'tunnel to this server) entered your address. Nothing happens without the code. Tell the other '
+                 'admins, and look at the audit log: sudo -u hgpanel python3 /usr/local/lib/host-guard-panel/hgpanel.py audit')
             sent.append({'at': now(), 'email': email})
             done += 1
         elif kind == 'signed-in':
@@ -2215,46 +2292,51 @@ def _panel_outbox(dfd, uid):
                  'sudo -u hgpanel python3 /usr/local/lib/host-guard-panel/hgpanel.py audit')
             told.append({'at': now(), 'email': email})
             done += 1
-        elif kind == 'approve':
-            # fix / hold / reboot, confirmed on the dashboard with a fresh mailed code; root still
-            # decides: a known action only, 10 changes an hour, the approvals rules (a reboot
-            # needs two admins), every result mailed to every admin
-            if len(changes) >= 10:
+        elif kind == 'change-request':
+            # a dashboard change (a source, fix, hold, reboot): root, not the panel, makes the code,
+            # bound to this admin and exactly this change, and mails it with root's own words for it.
+            # A taken-over panel can ask, but never confirm without the admin's mailbox.
+            cid, ch = str(data.get('cid', '')), data.get('change')
+            what = change_summary(ch)
+            mine = [x for x in sent if x['email'] == email and x['at'] > now() - 900]
+            if not CHANGE_ID.fullmatch(cid) or not what or cid in pending or len(pending) >= 50 \
+                    or len(mine) >= 5 or len(sent) >= 30:
                 refused += 1
-                print(f'panel-outbox: approval by {email} not taken (10 an hour)')
+                print(f'panel-outbox: change code for {email} not sent')
                 continue
-            changes.append({'at': now(), 'email': email})
-            ok, msg = approvals_module().approve(this(), str(data.get('verb', '')), str(data.get('target', '')),
-                                                 email, 'dashboard')
-            if ok and 'another admin' not in msg:
-                mail(subject=f'Approved on the dashboard: {data.get("verb")} {data.get("target")} ({email})',
-                     category='Approval', level='alert', body=f'{email} approved it on the dashboard.\nResult: {msg}\n\n'
-                     'Every approval is in the log:  sudo hostguard approvals')
-            elif not ok:
-                mail(subject='Dashboard approval not taken', category='Approval', level='info', to=[email],
-                     body=f'Your approval did nothing: {msg}')
+            nonce = secrets.token_hex(8)
+            pending[cid] = {'email': email, 'change': ch, 'nonce': nonce, 'at': now(), 'tries': 0}
+            mail(subject='Your code to confirm a dashboard change', category='Sign-in', level='info', to=[email], body=
+                 f'Code: {change_code(cid, email, nonce, ch)}\n\nIt confirms this change on the host-guard dashboard of '
+                 f'{C["SITE"]}, and nothing else:\n\n  {what}\n\nIt works once, for 10 minutes.\n\n'
+                 'Not you? Someone is signed in as you: do not enter this code, sign out everywhere '
+                 '(sudo -u hgpanel python3 /usr/local/lib/host-guard-panel/hgpanel.py logout-all) and tell the other admins.')
+            sent.append({'at': now(), 'email': email})
             done += 1
-            exported = True
-        elif kind in ('source-add', 'source-remove'):
-            # an admin confirmed it with a mailed code on the dashboard; a taken-over panel could
-            # skip that, so root still decides: context sources only, public https only, at most
-            # SOURCES_MAX, 10 changes an hour, every change mailed to every admin
+        elif kind == 'confirm':
+            cid, code = str(data.get('cid', '')), str(data.get('code', ''))
+            p = pending.get(cid)
+            if not p or p['email'] != email or not re.fullmatch(r'[0-9]{6}', code):
+                refused += 1
+                continue
+            if not hmac.compare_digest(change_code(cid, email, p['nonce'], p['change']), code):
+                p['tries'] = p.get('tries', 0) + 1
+                left = 5 - p['tries']
+                if left <= 0:
+                    pending.pop(cid)
+                mail(subject='Dashboard change not made: wrong code', category='Sign-in', level='info', to=[email],
+                     body='The code did not match the change you asked for. Nothing was changed. '
+                     + (f'{left} more tries for this change.' if left > 0 else 'Ask for a new code on the dashboard.'))
+                refused += 1
+                continue
+            pending.pop(cid)
             if len(changes) >= 10:
                 refused += 1
-                print(f'panel-outbox: source change by {email} not made (10 an hour)')
+                mail(subject='Dashboard change not made', category='Advisory', level='info', to=[email],
+                     body='At most 10 dashboard changes are made an hour. Try again later.')
                 continue
             changes.append({'at': now(), 'email': email})
-            sh = shield_module()
-            st = load('shield.json')
-            by = f'{email} (on the dashboard)'
-            if kind == 'source-add':
-                ok, msg = sh.add_source(this(), st, data.get('name', ''), data.get('url', ''),
-                                        data.get('fmt', 'feed'), by=by)
-            else:
-                ok, msg = sh.remove_source(this(), st, str(data.get('id', '')), by=by)
-            if not ok:
-                mail(subject='Dashboard change not made', category='Advisory', level='info', to=[email],
-                     body=f'Your change was not made: {msg}')
+            _apply_change(p['change'], email)
             done += 1
             exported = True
         else:
@@ -2264,7 +2346,7 @@ def _panel_outbox(dfd, uid):
             export()                                         # the dashboard shows the new list at once
         except Exception as e:
             print(f'panel-outbox: export failed: {e}')
-    s['sent'], s['notices'], s['changes'] = sent, told, changes
+    s['sent'], s['notices'], s['changes'], s['pending'] = sent, told, changes, pending
     save(s, 'panel-mail.json')
     print(f'panel-outbox: {done} mailed, {refused} refused')
 

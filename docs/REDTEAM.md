@@ -3,7 +3,7 @@
 Every change to host-guard is attacked before it can merge. CI builds a server with
 host-guard installed by its version manager, then attacks it from separate containers on
 an isolated network, and attacks the dashboard from a real browser (headless Chromium)
-the way a hostile web page would: 56 attacks, each mapped to a
+the way a hostile web page would: 67 attacks, each mapped to a
 [MITRE ATT&CK](https://attack.mitre.org/) technique and scored **stopped** (the defense
 worked as designed), **gap** (a known limitation, reported and planned) or **failed**
 (a defense did not work: CI fails and nothing merges or releases).
@@ -27,6 +27,7 @@ Run it yourself: `bash ci/redteam/run.sh` (Docker needed; results in `redteam-ou
 | HOST-8 | Loader warnings caused by `/etc/ld.so.preload` were read as a root SSH login from the internet (a false critical alert) | only sshd's real "Accepted ... for root from ADDRESS" lines count |
 | HOST-9 | Flood protection held a new-login-account alert after four noisy changes in the hour: an intruder could bury the alert that matters | `Intrusion` and `Host change` mails are never held |
 | GUI-2 | A new cross-site check refused the admin's own sign-in: Chrome sends `Origin: null` on a same-origin form under `Referrer-Policy: no-referrer` | `Origin: null` is judged by the browser's own `Sec-Fetch-Site` |
+| MAIL-5 | An action line with more after the code (`HOLD hg-...; touch /tmp/x`) was taken as the action, the rest ignored (nothing was run) | the line must be the action and the code alone, or it is refused as not understood |
 
 ## The dashboard, as the browser stage saw it
 
@@ -41,11 +42,11 @@ The planted `<script>` and `<img onerror>` payloads appear in the dashboard as p
 
 ## Sample report
 
-Sample run, 2 min 23 s. Target: Ubuntu 24.04 with host-guard installed by its version manager (plain VPS profile, panel, off-site copies to an emulated S3), attacked from separate containers on an isolated network.
+Sample run, 24 min 32 s. Target: Ubuntu 24.04 with host-guard installed by its version manager (plain VPS profile, panel, off-site copies to an emulated S3), attacked from separate containers on an isolated network.
 
 | Result | Count |
 |---|---|
-| Stopped or detected as designed | 53 |
+| Stopped or detected as designed | 64 |
 | Known gaps (reported, planned) | 3 |
 | Failed defenses | 0 |
 
@@ -53,13 +54,10 @@ Sample run, 2 min 23 s. Target: Ubuntu 24.04 with host-guard installed by its ve
 
 | ID | ATT&CK | Attack | Expected defense | Result | Evidence |
 |---|---|---|---|---|---|
-| SSH-1 | [T1110.001](https://attack.mitre.org/techniques/T1110/001/) | Log in with the right password | refused: keys only | stopped | exit 255: ops@target: Permission denied (publickey).
- |
-| SSH-2 | [T1078.003](https://attack.mitre.org/techniques/T1078/003/) | Log in as root with root's own valid key | refused: no root login | stopped | exit 255: root@target: Permission denied (publickey).
- |
-| SSH-3 | [T1078.003](https://attack.mitre.org/techniques/T1078/003/) | Log in as a real user with a valid key who is not the admin | refused: one allowed user | stopped | exit 255: intruder@target: Permission denied (publickey).
- |
-| SSH-4 | [T1110.001](https://attack.mitre.org/techniques/T1110/001/) | SSH brute force (8 user names) | address banned, port 22 closed to it | stopped | 172.18.0.4 banned by the sshd jail 31s after the first try; port 22 from it: refused |
+| SSH-1 | [T1110.001](https://attack.mitre.org/techniques/T1110/001/) | Log in with the right password | refused: keys only | stopped | exit 255: ops@target: Permission denied (publickey). |
+| SSH-2 | [T1078.003](https://attack.mitre.org/techniques/T1078/003/) | Log in as root with root's own valid key | refused: no root login | stopped | exit 255: root@target: Permission denied (publickey). |
+| SSH-3 | [T1078.003](https://attack.mitre.org/techniques/T1078/003/) | Log in as a real user with a valid key who is not the admin | refused: one allowed user | stopped | exit 255:  |
+| SSH-4 | [T1110.001](https://attack.mitre.org/techniques/T1110/001/) | SSH brute force (8 user names) | address banned, port 22 closed to it | stopped | 172.20.0.4 banned by the sshd jail 902s after the first try; port 22 from it: refused |
 | SSH-5 | [T1499](https://attack.mitre.org/techniques/T1499/) | The legitimate admin logs in during the attack | works (bans are per address) | stopped | admin key login: logged-in |
 | SSH-6 | [T1110](https://attack.mitre.org/techniques/T1110/) | The admins learn about the ban | mail with the address and the reason | stopped | mail: Subject: [P2 Attention] Attack \| redteam-target \| Blocked 2 address(es) |
 
@@ -67,8 +65,8 @@ Sample run, 2 min 23 s. Target: Ubuntu 24.04 with host-guard installed by its ve
 
 | ID | ATT&CK | Attack | Expected defense | Result | Evidence |
 |---|---|---|---|---|---|
-| WEB-1 | [T1595.003](https://attack.mitre.org/techniques/T1595/003/) | Probe for secrets and admin pages (.env, .git, wp-login, phpMyAdmin, .aws) | address banned for a day, site closed to it | stopped | answers: 404 404 404 404 404 ; 172.18.0.5 banned by web-probe; site from it: refused |
-| WEB-2 | [T1498.001](https://attack.mitre.org/techniques/T1498/001/) | Request flood (150 requests as fast as possible) | rate limit answers 503, then the address is banned | stopped | answers:  13 200 137 503 ; 172.18.0.6 banned by nginx-limit-req |
+| WEB-1 | [T1595.003](https://attack.mitre.org/techniques/T1595/003/) | Probe for secrets and admin pages (.env, .git, wp-login, phpMyAdmin, .aws) | address banned for a day, site closed to it | stopped | answers: 404 404 404 404 404 ; 172.20.0.5 banned by web-probe; site from it: refused |
+| WEB-2 | [T1498.001](https://attack.mitre.org/techniques/T1498/001/) | Request flood (150 requests as fast as possible) | rate limit answers 503, then the address is banned | stopped | answers:  81 000 12 200 57 503 ; 172.20.0.6 banned by nginx-limit-req |
 | WEB-3 | [T1499](https://attack.mitre.org/techniques/T1499/) | A normal visitor during the attacks | served | stopped | HTTP 200 |
 
 ## Host: persistence, privilege, miners
@@ -78,7 +76,7 @@ Sample run, 2 min 23 s. Target: Ubuntu 24.04 with host-guard installed by its ve
 | HOST-1 | [T1136.001](https://attack.mitre.org/techniques/T1136/001/) | A second root account (UID 0) named sysbackup | locked at once, critical mail | stopped | account status: L; critical mail: yes |
 | HOST-2 | [T1496](https://attack.mitre.org/techniques/T1496/) | A crypto miner (xmrig) started from /tmp | killed, binary quarantined, critical mail | stopped | still running: no; quarantined copies: 1 |
 | HOST-3 | [T1036.005](https://attack.mitre.org/techniques/T1036/005/) | A program with a harmless name running from /dev/shm | killed (memory-only folder), critical mail | stopped | still running: no |
-| HOST-4 | [T1036.004](https://attack.mitre.org/techniques/T1036/004/) | A miner renamed like a kernel thread, run from /usr/local/bin | detected | gap | still running: 5497. Detection is by name and location; CPU and behaviour anomalies are planned |
+| HOST-4 | [T1036.004](https://attack.mitre.org/techniques/T1036/004/) | A miner renamed like a kernel thread, run from /usr/local/bin | detected | gap | still running: 8458. Detection is by name and location; CPU and behaviour anomalies are planned |
 | HOST-5 | [T1098.004](https://attack.mitre.org/techniques/T1098/004/) | An extra SSH key added for the admin user | alert mail naming the key | stopped | mail names the key: yes |
 | HOST-6 | [T1548.003](https://attack.mitre.org/techniques/T1548/003/) | A sudoers rule giving another user root | alert mail naming the file | stopped | mail names /etc/sudoers.d/zz-maint: yes |
 | HOST-7 | [T1053.003](https://attack.mitre.org/techniques/T1053/003/) | A cron job that downloads and runs a script | alert mail naming the file | stopped | mail names /etc/cron.d/sys-update: yes |
@@ -96,7 +94,7 @@ Sample run, 2 min 23 s. Target: Ubuntu 24.04 with host-guard installed by its ve
 
 | ID | ATT&CK | Attack | Expected defense | Result | Evidence |
 |---|---|---|---|---|---|
-| BAK-1 | [T1530](https://attack.mitre.org/techniques/T1530/) | Read the backups (local disk and the off-site S3 copy) | encrypted (AES-256), off-site copy present | stopped | files with readable /etc/passwd lines: none; S3 copy of server-files-20261119T142647Z.gz.gpg: HTTP 200 |
+| BAK-1 | [T1530](https://attack.mitre.org/techniques/T1530/) | Read the backups (local disk and the off-site S3 copy) | encrypted (AES-256), off-site copy present | stopped | files with readable /etc/passwd lines: none; S3 copy of server-files-20261124T101736Z.gz.gpg: HTTP 200 |
 | BAK-2 | [T1005](https://attack.mitre.org/techniques/T1005/) | A local user copies the backup files | root only (mode 600) | stopped | modes: 600 root  |
 | BAK-3 | [T1490](https://attack.mitre.org/techniques/T1490/) | Is the off-site backup restorable? | downloaded from S3, decrypted, unpacked | stopped | restore-test: ok |
 | BAK-4 | [T1565.001](https://attack.mitre.org/techniques/T1565/001/) | Ransomware or an insider corrupts the off-site copy | restore test fails and mails | stopped | object rewritten (GET, PUT): 200 200; restore test: restore-test: FAILED; mail: yes |
@@ -142,6 +140,22 @@ Sample run, 2 min 23 s. Target: Ubuntu 24.04 with host-guard installed by its ve
 | PANEL-13 | [T1185](https://attack.mitre.org/techniques/T1185/) | A hostile page in the same browser reads the panel (fetch with credentials, CORS) | the browser refuses: the panel sends no CORS headers | stopped | hostile page result: BLOCKED |
 | PANEL-14 | [T1185](https://attack.mitre.org/techniques/T1185/) | A hostile page posts a sign-out form to the panel (cross-site request forgery) | refused: the cookie is not sent cross-site, the origin is checked, the form token is missing | stopped | panel answered: 'cross-site request refused'; admin still signed in: True |
 | PANEL-15 | [T1185](https://attack.mitre.org/techniques/T1185/) | A hostile page frames the panel (clickjacking) | the browser refuses to show it | stopped | frame shows the dashboard: False; frame url: chrome-error://chromewebdata/ |
+| PANEL-23 | [T1068](https://attack.mitre.org/techniques/T1068/) | The panel's own user (if the panel were taken over) writes root approvals and source changes directly, confirms a hold with guessed codes, and an admin confirms an advisory source inside the network (SSRF) | direct writes and guesses do nothing; the inside source is refused by root and the admin told | stopped | direct refused: True; guesses refused: True; real code mailed: True; finding open; sources added: none |
+
+## Approvals by mail reply (forged, replayed and quoted replies; a real IMAP server)
+
+| ID | ATT&CK | Attack | Expected defense | Result | Evidence |
+|---|---|---|---|---|---|
+| MAIL-0 | [T1078](https://attack.mitre.org/techniques/T1078/) | The reply reader logs in to a real IMAP server over TLS (its own certificate, IMAP_CA) | it reads the inbox | stopped | dovecot up |
+| MAIL-1 | [T1656](https://attack.mitre.org/techniques/T1656/) | A forged reply from an admin address carrying a real HOLD code (no verdict from the mail server) | nothing done; the code is void; every admin warned | stopped | replies: refused: no Authentication-Results from the mail server replies: 1 read; finding open; warning mailed: True |
+| MAIL-2 | [T1656](https://attack.mitre.org/techniques/T1656/) | A forged reply with its own "dmarc=pass" Authentication-Results below the mail server's "fail" | only the top line, from our mail server, counts: refused | stopped | finding open; log: [{'action': 'hold', 'at': 1795515537.3500776, 'by': 'security@example.com', 'channel': 'email', 'result': 'refused: DMARC did not pass for example.com (its code is now void)', 'target': '-'}] |
+| MAIL-3 | [T1656](https://attack.mitre.org/techniques/T1656/) | A reply whose top verdict claims pass but names another mail server | refused | stopped | finding open; log: [{'action': 'hold', 'at': 1795515537.5224981, 'by': 'security@example.com', 'channel': 'email', 'result': 'refused: the mail server\'s result is from "mx.attacker.example", not mx.redteam.test (its code is now void)', 'target': '-'}] |
+| MAIL-4 | [T1078](https://attack.mitre.org/techniques/T1078/) | A genuine (DMARC pass) reply from an address that is not an admin | refused, and not answered | stopped | finding open; log: [{'action': '-', 'at': 1795515537.69064, 'by': 'outsider@example.org', 'channel': 'email', 'result': 'refused: not an admin address', 'target': '-'}] |
+| MAIL-5 | [T1059](https://attack.mitre.org/techniques/T1059/) | Genuine admin replies with shell commands instead of an action line | nothing is ever run | stopped | /tmp/mail-pwned exists: False; finding open |
+| MAIL-6 | [T1204](https://attack.mitre.org/techniques/T1204/) | A genuine reply that only quotes host-guard's mail (the code is below the quote line) | nothing done: only the reply's own first lines count | stopped | finding open |
+| MAIL-7 | [T1550](https://attack.mitre.org/techniques/T1550/) | A genuine admin reply holds the fix; then the same code is replayed by another admin | the first works and is logged (who, email); the replay does nothing | stopped | after the first: held=True; replay: refused: the code is unknown, used, expired or for another action |
+| MAIL-8 | [T1529](https://attack.mitre.org/techniques/T1529/) | A reboot approved by one admin by mail | nothing until a second admin approves (here on the dashboard, with the code root mailed); then a backup and the reboot, naming both and how | stopped | after one: not rebooted=True; code mailed: True; after two: security@example.com (email) and admin2@example.com (dashboard) |
+| MAIL-9 | [T1114](https://attack.mitre.org/techniques/T1114/) | Mail in the account that is not a reply to host-guard | left unread and untouched | stopped | unread left: 4 |
 
 ## The pip package (supply chain)
 
@@ -149,13 +163,13 @@ Sample run, 2 min 23 s. Target: Ubuntu 24.04 with host-guard installed by its ve
 |---|---|---|---|---|---|
 | PKG-1 | [T1195.002](https://attack.mitre.org/techniques/T1195/002/) | Tamper with the installed package (a command added to its install.sh), then upgrade as root | refused before anything of it runs | stopped | host-guard: the installed host-guard package was changed after it was installed, so nothing of it runs:   changed: /opt/pipx/venvs/host-guard/lib/python3.12/site-packages/host_guard/payload/guard/install.sh Reinstall it  |
 | PKG-2 | [T1195.002](https://attack.mitre.org/techniques/T1195/002/) | Plant an extra file in the installed package, then upgrade as root | refused (the file is not in the package's RECORD) | stopped | host-guard: the installed host-guard package was changed after it was installed, so nothing of it runs:   added: /opt/pipx/venvs/host-guard/lib/python3.12/site-packages/host_guard/payload/guard/sitecustomize.py Reinstall |
-| PKG-3 | [T1195.001](https://attack.mitre.org/techniques/T1195/001/) | Dependency confusion or typosquatting through the package's dependencies; code run at every Python start (.pth) | no dependencies at all; no .pth file that runs code | stopped | other packages in its environment: none; .pth files that run code: none (all .pth: pipx_shared.pth , path entries only); wheel attacked: sha256 43bc08370a094da0... |
+| PKG-3 | [T1195.001](https://attack.mitre.org/techniques/T1195/001/) | Dependency confusion or typosquatting through the package's dependencies; code run at every Python start (.pth) | no dependencies at all; no .pth file that runs code | stopped | other packages in its environment: none; .pth files that run code: none (all .pth: pipx_shared.pth , path entries only); wheel attacked: sha256 3d3b57dbd85f0f96... |
 | PKG-4 | [T1574.010](https://attack.mitre.org/techniques/T1574/010/) | A non-root user rewrites the package, the host-guard command or a release (all run as root) | every file owned by root, none writable by others | stopped | writable or not root's: none |
-| PKG-5 | [T1195.002](https://attack.mitre.org/techniques/T1195/002/) | After the attacks: the install is still the one from the tested wheel | status unchanged, upgrade works again | stopped | host-guard: 0.4.0 (since 2026-11-19 14:26) this copy of the manager carries: 0.4.0 rollback would undo: 0001-install-0.4.0 (back to nothing)  |
+| PKG-5 | [T1195.002](https://attack.mitre.org/techniques/T1195/002/) | After the attacks: the install is still the one from the tested wheel | status unchanged, upgrade works again | stopped | host-guard: 0.5.0 (since 2026-11-24 10:00) this copy of the manager carries: 0.5.0 rollback would undo: 0001-install-0.5.0 (back to nothing)  |
 
 ## Known gaps
 
-- **HOST-4** A miner renamed like a kernel thread, run from /usr/local/bin: still running: 5497. Detection is by name and location; CPU and behaviour anomalies are planned
+- **HOST-4** A miner renamed like a kernel thread, run from /usr/local/bin: still running: 8458. Detection is by name and location; CPU and behaviour anomalies are planned
 - **NET-2** A port scan of 20 common ports: no scan detection yet (closed ports are not logged); planned with the anomaly release
 - **PANEL-6** Stolen session cookie replayed from another browser: HTTP 200: the stolen cookie works from another client; no binding or anomaly alert yet (planned: session binding and hijack alerts)
 
@@ -180,6 +194,28 @@ Sample run, 2 min 23 s. Target: Ubuntu 24.04 with host-guard installed by its ve
 - [P3 Info] Sign-in | redteam-target | Your dashboard sign-in code
 - [P3 Info] Sign-in | redteam-target | Your dashboard sign-in code
 - [P3 Info] Sign-in | redteam-target | Your dashboard sign-in code
+- [P1 Critical] Approval | redteam-target | Forged approval refused: hold deadbeef
+- [P3 Info] Approval | redteam-target | Your reply did not approve anything
+- [P1 Critical] Approval | redteam-target | Forged approval refused: hold deadbeef
+- [P1 Critical] Approval | redteam-target | Forged approval refused: hold deadbeef
+- [P3 Info] Approval | redteam-target | Your reply was not understood
+- [P3 Info] Approval | redteam-target | Your reply was not understood
+- [P3 Info] Advisory | redteam-target | Automatic fix held: openssl 3.0.2 (CVE-2026-1111)
+- [P2 Attention] Approval | redteam-target | Approved by mail: hold deadbeef (security@example.com)
+- [P3 Info] Approval | redteam-target | Your reply did not approve anything
+- [P2 Attention] Approval | redteam-target | Approval 1 of 2: reboot now
+- [P3 Info] Sign-in | redteam-target | Your code to confirm a dashboard change
+- [P2 Attention] Updates | redteam-target | Rebooting now: approved by admins
+- [P2 Attention] Approval | redteam-target | Approved on the dashboard: reboot now (admin2@example.com)
+- [P3 Info] Sign-in | redteam-target | Your code to confirm a dashboard change
+- [P3 Info] Sign-in | redteam-target | Dashboard change not made: wrong code
+- [P3 Info] Sign-in | redteam-target | Dashboard change not made: wrong code
+- [P3 Info] Sign-in | redteam-target | Dashboard change not made: wrong code
+- [P3 Info] Sign-in | redteam-target | Dashboard change not made: wrong code
+- [P3 Info] Sign-in | redteam-target | Dashboard change not made: wrong code
+- [P3 Info] Sign-in | redteam-target | Your code to confirm a dashboard change
+- [P3 Info] Advisory | redteam-target | Dashboard change not made
+- [P2 Attention] Host change | redteam-target | New login account: guardmail; Security files changed
 - [Resolved] Backup | redteam-target | Backups fresh again
 - [P3 Info] Test | redteam-target | Test mail
 

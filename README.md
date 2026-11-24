@@ -66,10 +66,10 @@ security updates.
 
 ## Proven by attack
 
-Every change is attacked in CI before it can merge: 56 real attacks on an isolated
+Every change is attacked in CI before it can merge: 67 real attacks on an isolated
 network against a server installed by the version manager, plus the dashboard attacked
 from a real browser, each mapped to MITRE ATT&CK.
-**53 stopped or detected, 3 known gaps, 0 failed.** The suite lives in
+**64 stopped or detected, 3 known gaps, 0 failed.** The suite lives in
 [ci/redteam/](ci/redteam/) and runs as the `Red team` job, required for every merge and release.
 
 | Phase | Attacks | Result |
@@ -238,7 +238,7 @@ python ci/build_dist.py && docker run --rm -v "$PWD:/src:ro" -v "$PWD/dist:/dist
 | Install, upgrade, rollback, uninstall (same three) | the pip package through its whole life; after `uninstall --purge` the server is byte-for-byte as before |
 | Database backups and restore tests | real MariaDB and PostgreSQL, restored into throwaway databases |
 | Package | sdist and wheel carry what runs on a server; `twine check`; VERSION matches the changelog |
-| Red team | 56 real attacks on an isolated network, scored per MITRE ATT&CK; a failed defense fails CI |
+| Red team | 67 real attacks on an isolated network, scored per MITRE ATT&CK; a failed defense fails CI |
 | Clouds | AWS, Google Cloud, Azure, Oracle Cloud and bare metal detected; backups off-site to emulated stores and restore-tested; forged signatures refused |
 | CodeQL (Python, Actions) | security-extended queries on every change and weekly |
 | Lint, Bandit, gitleaks, ShellCheck, systemd units | code quality, security patterns, no secret in the whole history, unit files valid |

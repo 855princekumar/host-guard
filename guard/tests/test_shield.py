@@ -5,6 +5,7 @@ dashboard's changes only for admins and only a few an hour."""
 import importlib.util
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -191,14 +192,26 @@ def drop(hg, tmp_path, data):
     hg.C.update(PANEL_OUTBOX=str(box), PANEL_USER=pwd.getpwuid(os.getuid()).pw_name)
 
 
+def dashboard(hg, tmp_path, email, change, code=None):
+    """The panel's two steps as root sees them: a change request (root mails its own code),
+    then the admin's code. Returns the change id."""
+    cid = os.urandom(16).hex()
+    drop(hg, tmp_path, {'kind': 'change-request', 'email': email, 'cid': cid, 'change': change})
+    hg.panel_outbox()
+    if code is None:
+        found = re.findall(r'Code: (\d{6})', mails(hg))
+        code = found[-1] if found else '000000'
+    drop(hg, tmp_path, {'kind': 'confirm', 'email': email, 'cid': cid, 'code': code})
+    hg.panel_outbox()
+    return cid
+
+
 def test_root_adds_a_dashboard_source_only_for_an_admin_and_exports_it(hg, tmp_path, monkeypatch):
     resolves_to(monkeypatch, {'news.example': PUBLIC})
-    drop(hg, tmp_path, {'kind': 'source-add', 'email': 'evil@example.org', 'name': 'Evil', 'url': 'https://news.example/'})
-    hg.panel_outbox()
-    assert not hg.load('shield.json').get('extra_sources')
-    drop(hg, tmp_path, {'kind': 'source-add', 'email': 'sec@example.com', 'name': 'Example News',
-                        'url': 'https://news.example/', 'fmt': 'page'})
-    hg.panel_outbox()
+    dashboard(hg, tmp_path, 'evil@example.org', {'action': 'add', 'name': 'Evil', 'url': 'https://news.example/'})
+    assert not hg.load('shield.json').get('extra_sources') and 'Code:' not in mails(hg)
+    dashboard(hg, tmp_path, 'sec@example.com', {'action': 'add', 'name': 'Example News', 'url': 'https://news.example/',
+                                                'fmt': 'page'})
     extra = hg.load('shield.json')['extra_sources']
     assert [(s['name'], s['fmt'], s['by']) for s in extra] == [('Example News', 'page', 'sec@example.com (on the dashboard)')]
     exported = json.load(open(hg.C['EXPORT_FILE']))['sources']
@@ -208,30 +221,107 @@ def test_root_adds_a_dashboard_source_only_for_an_admin_and_exports_it(hg, tmp_p
 
 def test_root_refuses_a_dashboard_source_inside_the_network_and_says_why(hg, tmp_path, monkeypatch):
     resolves_to(monkeypatch, {'metadata.example': '169.254.169.254'})
-    drop(hg, tmp_path, {'kind': 'source-add', 'email': 'sec@example.com', 'name': 'Creds',
-                        'url': 'https://metadata.example/latest/meta-data/'})
-    hg.panel_outbox()
+    dashboard(hg, tmp_path, 'sec@example.com', {'action': 'add', 'name': 'Creds',
+                                                'url': 'https://metadata.example/latest/meta-data/'})
     assert not hg.load('shield.json').get('extra_sources')
     text = mails(hg)
     assert 'Dashboard change not made' in text and 'not a public address' in text
 
 
-def test_dashboard_source_changes_are_limited_to_ten_an_hour(hg, tmp_path, monkeypatch):
-    resolves_to(monkeypatch, {f'n{i}.example': PUBLIC for i in range(14)})
-    hg.C['SOURCES_MAX'] = '50'
-    for i in range(14):
-        drop(hg, tmp_path, {'kind': 'source-add', 'email': 'sec@example.com', 'name': f'N{i}', 'url': f'https://n{i}.example/'})
+def test_dashboard_changes_are_limited_to_ten_an_hour(hg, tmp_path, monkeypatch):
+    resolves_to(monkeypatch, {'n.example': PUBLIC})
+    hg.save({'changes': [{'at': time.time(), 'email': 'sec@example.com'}] * 10}, 'panel-mail.json')
+    dashboard(hg, tmp_path, 'sec@example.com', {'action': 'add', 'name': 'N', 'url': 'https://n.example/'})
+    assert not hg.load('shield.json').get('extra_sources') and 'At most 10 dashboard changes' in mails(hg)
+
+
+def test_the_code_mail_names_the_change_in_roots_own_words(hg, tmp_path):
+    drop(hg, tmp_path, {'kind': 'change-request', 'email': 'sec@example.com', 'cid': os.urandom(16).hex(),
+                        'change': {'action': 'add', 'name': 'News\nBcc: x@evil', 'url': 'https://news.example/'}})
     hg.panel_outbox()
-    assert len(hg.load('shield.json')['extra_sources']) == 10
-
-
-def test_a_confirm_code_mail_names_the_change(hg, tmp_path):
-    drop(hg, tmp_path, {'kind': 'code', 'email': 'sec@example.com', 'code': '123456', 'purpose': 'confirm',
-                        'summary': 'add the feed "Example News" at https://news.example/ as an advisory source\nBcc: x@evil'})
+    assert 'Code:' not in mails(hg)                                         # not a change root knows: no code
+    drop(hg, tmp_path, {'kind': 'change-request', 'email': 'sec@example.com', 'cid': os.urandom(16).hex(),
+                        'summary': 'a harmless thing', 'change': {'action': 'add', 'name': 'Example News',
+                                                                 'url': 'https://news.example/'}})
     hg.panel_outbox()
     text = mails(hg)
-    assert 'Your code to confirm a dashboard change' in text and 'Code: 123456' in text
-    assert 'add the feed "Example News" at https://news.example/' in text and '\nBcc:' not in text
+    assert 'Your code to confirm a dashboard change' in text and re.search(r'Code: \d{6}', text)
+    assert 'add the feed "Example News" at https://news.example/' in text and 'harmless' not in text
+
+
+# audit 0.5.0, finding 1: a taken-over panel picked the code itself and wrote the change straight to root
+def test_a_taken_over_panel_cannot_make_root_change_anything_without_the_mailed_code(hg, tmp_path, monkeypatch):
+    resolves_to(monkeypatch, {'evil.example': PUBLIC})
+    for d in ({'kind': 'source-add', 'email': 'sec@example.com', 'name': 'Evil', 'url': 'https://evil.example/'},
+              {'kind': 'approve', 'email': 'sec@example.com', 'verb': 'reboot', 'target': 'now'},
+              {'kind': 'code', 'email': 'sec@example.com', 'code': '123456', 'purpose': 'confirm'}):
+        drop(hg, tmp_path, d)
+    hg.panel_outbox()
+    assert not hg.load('shield.json').get('extra_sources')
+    for guess in ('000000', '123456', '999999', '111111', '222222', '333333'):
+        dashboard(hg, tmp_path, 'sec@example.com', {'action': 'add', 'name': 'Evil', 'url': 'https://evil.example/'},
+                  code=guess)
+    assert not hg.load('shield.json').get('extra_sources')
+    assert 'Dashboard change not made: wrong code' in mails(hg)
+
+
+# audit 0.5.0, finding 2: the code confirmed whatever change was waiting, not the one it named
+def test_a_code_confirms_only_the_change_it_was_mailed_for(hg, tmp_path, monkeypatch):
+    resolves_to(monkeypatch, {'good.example': PUBLIC, 'evil.example': PUBLIC})
+    a, b = os.urandom(16).hex(), os.urandom(16).hex()
+    drop(hg, tmp_path, {'kind': 'change-request', 'email': 'sec@example.com', 'cid': a,
+                        'change': {'action': 'add', 'name': 'Good', 'url': 'https://good.example/'}})
+    hg.panel_outbox()
+    code_a = re.findall(r'Code: (\d{6})', mails(hg))[-1]
+    drop(hg, tmp_path, {'kind': 'change-request', 'email': 'sec@example.com', 'cid': b,
+                        'change': {'action': 'add', 'name': 'Evil', 'url': 'https://evil.example/'}})
+    hg.panel_outbox()
+    drop(hg, tmp_path, {'kind': 'confirm', 'email': 'sec@example.com', 'cid': b, 'code': code_a})
+    drop(hg, tmp_path, {'kind': 'confirm', 'email': 'ops@example.com', 'cid': a, 'code': code_a})   # another admin
+    hg.panel_outbox()
+    assert not hg.load('shield.json').get('extra_sources')
+    drop(hg, tmp_path, {'kind': 'confirm', 'email': 'sec@example.com', 'cid': a, 'code': code_a})
+    hg.panel_outbox()
+    assert [s['name'] for s in hg.load('shield.json')['extra_sources']] == ['Good']
+
+
+# audit 0.5.0, finding 3: lazy regexes took minutes on a page of unclosed tags
+@pytest.mark.parametrize('text', ['<item' * 200_000, '<entry><title' * 100_000, '<item><link' * 100_000])
+def test_feeds_are_parsed_in_linear_time(sh, text):
+    t = time.time()
+    sh.rss_items(text)
+    sh.page_items(text, 'https://news.example/')
+    assert time.time() - t < 3
+
+
+def test_pages_are_cleaned_in_linear_time(hg):
+    t = time.time()
+    out = hg._drop_blocks('<p>keep</p>' + '<script' * 300_000)
+    out2 = re.sub(r'<[^<>]*>', ' ', '<' * 500_000)
+    assert time.time() - t < 3 and 'keep' in out and out2
+    assert hg._drop_blocks('a<script>x</script>b<STYLE x>y</style>c').split() == ['a', 'b', 'c']
+
+
+def test_feed_items_are_still_read(sh):
+    rss = ('<rss><channel><item><title>nginx flaw CVE-2026-1</title><link>https://n.example/1</link></item>'
+           '<entry><title><![CDATA[OpenSSL <b>bug</b>]]></title><link href="https://n.example/2"/></entry></channel></rss>')
+    assert sh.rss_items(rss) == [('nginx flaw CVE-2026-1', 'https://n.example/1'), ('OpenSSL bug', 'https://n.example/2')]
+
+
+# audit 0.5.0, finding 4: a hold made while a run was going was overwritten by the run, and the fix ran
+def test_a_hold_made_during_a_run_survives_it_and_stops_the_fix(hg, sh, monkeypatch):
+    hg.C['AUTO_FIX'] = 'critical'
+    hg.save({'known': {'deadbeef': {'tier': 'Critical', 'status': 'open', 'name': 'openssl 3', 'where': 'host',
+                                    'vuln': 'CVE-2026-1', 'plan': {'kind': 'apt'}, 'text': 'x', 'due': 0}}}, 'shield.json')
+    state = hg.load('shield.json')                                          # the run starts
+    at_start = {k: v.get('status') for k, v in state['known'].items()}
+    st2 = hg.load('shield.json')                                            # an admin holds it meanwhile
+    assert sh.act(hg, st2, 'hold', 'deadbeef', 'sec@example.com (email)')[0]
+    applied = []
+    monkeypatch.setattr(sh, 'apply_fix', lambda *a: applied.append(a))
+    assert sh.due_fixes(hg, state) == [] and not applied                    # the run's due fix is skipped
+    sh._keep_admin_changes(hg, state['known'], at_start)
+    assert state['known']['deadbeef']['status'] == 'held' and 'sec@example.com' in state['known']['deadbeef']['held_by']
 
 
 # ---------------------------------------------------------------- tiers

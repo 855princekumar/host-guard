@@ -45,6 +45,18 @@
     source addresses);
   - [docs/CI.md](docs/CI.md) on what runs, and how the suite is kept healthy and grows.
 
+### Security
+- Audit of the changes ([docs/audits/0.5.0.md](docs/audits/0.5.0.md)), all fixed before release:
+  - **The dashboard's confirm codes are now made by root,** bound to one admin and one exact
+    change; a taken-over panel could otherwise approve anything as any admin.
+  - A waiting change could be swapped under an admin's code.
+  - Hostile feeds could stall the advisories (parsing is now linear).
+  - A hold made during a shield run was undone.
+  - Newer mail could hide a reply.
+  - The DMARC result was read too loosely.
+- Found by the red team: a reply's action line must be the action and the code alone. Text after
+  the code was ignored before (nothing was ever run); now the line is refused as not understood.
+
 ### Fixed
 - Found by the new fuzzer before release: a reply whose headers the mail parser could not read
   raised an exception. Left unread in the inbox, one such mail would have stopped every reply

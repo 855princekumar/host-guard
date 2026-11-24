@@ -233,7 +233,7 @@ echo "==> Panel (raw HTTP through the tunnel)"
 T 'python3 /src/ci/redteam/panel_attack.py' > "$OUT/panel.jsonl" 2>"$OUT/panel.err"
 cat "$OUT/browser.jsonl" >> "$OUT/panel.jsonl"
 echo "==> Approvals by mail reply (a real IMAP server on the target)"
-T 'python3 /src/ci/redteam/approvals_attack.py' > "$OUT/approvals.jsonl" 2>"$OUT/approvals.err" || tail -5 "$OUT/approvals.err"
+T 'timeout 900 python3 /src/ci/redteam/approvals_attack.py' > "$OUT/approvals.jsonl" 2>"$OUT/approvals.err" || tail -5 "$OUT/approvals.err"
 grep -q '"MAIL-8"' "$OUT/approvals.jsonl" || record MAIL-X T1078 "The approvals stage ran" "it ran" FAIL "no approvals results: $(tail -1 "$OUT/approvals.err" | cut -c1-150)"
 cat "$OUT/approvals.jsonl" >> "$OUT/panel.jsonl"
 if [ "${ZAP:-0}" = 1 ]; then

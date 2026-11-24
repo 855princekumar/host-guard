@@ -62,6 +62,9 @@ comes back to every admin with the result.
 - **Act from quoted text.** Only the reply's own first lines count, down to the first quoted
   line (`>`) or the `On ... wrote:` line. A code that sits only in the quoted mail does
   nothing.
+- **Carry anything else.** The action line is the action and the code alone (a full stop at
+  most). `HOLD hg-...; touch /tmp/x` or `HOLD hg-... please` does nothing, and the admin is
+  told the reply was not understood. Nothing in a reply is ever run.
 - **Be replayed.** A used code is spent, and the same message is read only once.
 
 **A forged reply that carries a real code** means someone saw host-guard's mail. Nothing is

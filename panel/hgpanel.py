@@ -276,32 +276,43 @@ def start_change(con, ip, sess, form):
     else:
         return None, 'Unknown change.'
     with _lock:
-        con.execute('DELETE FROM changes WHERE created < ?', (time.time() - float(C['CODE_MIN']) * 60,))
+        t = time.time()
+        con.execute('DELETE FROM changes WHERE created < ?', (t - float(C['CODE_MIN']) * 60,))
+        asked = con.execute("SELECT COUNT(*) FROM audit WHERE event = 'change code requested' AND detail = ? AND at > ?",
+                            (sess['email'], t - 600)).fetchone()[0]
+        if asked >= 5:
+            audit(con, ip, 'change throttled', sess['email'])
+            return None, 'Too many changes asked for in 10 minutes. Try again later.'
+        cid = secrets.token_hex(16)
         con.execute('INSERT OR REPLACE INTO changes (sess, data, created) VALUES (?, ?, ?)',
-                    (sess['hash'], json.dumps(ch), time.time()))
-    request_code(con, ip, sess['email'], 'change:' + sess['hash'], purpose='confirm', summary=describe(ch))
-    return ch, f'A code to confirm this change is on its way to {sess["email"]}. It works once, for 10 minutes.'
+                    (sess['hash'], json.dumps(dict(ch, cid=cid, tries=0)), t))
+        audit(con, ip, 'change code requested', sess['email'])
+    outbox('change-request', sess['email'], cid=cid, change={k: v for k, v in ch.items() if k != 'what'})
+    return ch, (f'The server is mailing a code for this change to {sess["email"]}. It names the change in the '
+                'server\'s own words and works once, for 10 minutes.')
 
 
 def confirm_change(con, ip, sess, code):
-    """Returns (True, message) once the change went to root, else (False, message)."""
+    """Pass the admin's code for the waiting change to root, which alone can check it (the
+    panel never sees it). Returns (True, message) once handed on, else (False, message)."""
+    code = (code or '').strip()
     with _lock:
         row = con.execute('SELECT data, created FROM changes WHERE sess = ?', (sess['hash'],)).fetchone()
         if not row or time.time() - row[1] > float(C['CODE_MIN']) * 60:
             return False, 'No change is waiting for a code. Start again.'
-        ok, msg = check_code(con, ip, sess['email'], code, 'change:' + sess['hash'])
-        if not ok:
-            return False, msg
-        con.execute('DELETE FROM changes WHERE sess = ?', (sess['hash'],))
         ch = json.loads(row[0])
-        audit(con, ip, 'change confirmed', f'{sess["email"]}: {describe(ch)}')
-    if ch['action'] == 'approve':
-        outbox('approve', sess['email'], verb=ch['verb'], target=ch['target'])
-        return True, ('Sent to the server. It mails every admin what was done (a reboot needs another admin '
-                      'too). This page follows within a minute.')
-    outbox('source-' + ch['action'], sess['email'], **{k: v for k, v in ch.items() if k != 'action'})
-    return True, ('Sent to the server. It checks the address (https, a public host) and mails every admin '
-                  'when the source is added or removed, or why not. The list here follows within a few minutes.')
+        if not CODE_RE.fullmatch(code):
+            return False, 'Enter the 6-digit code from the mail.'
+        ch['tries'] = ch.get('tries', 0) + 1
+        if ch['tries'] >= 5:
+            con.execute('DELETE FROM changes WHERE sess = ?', (sess['hash'],))
+        else:
+            con.execute('UPDATE changes SET data = ? WHERE sess = ?', (json.dumps(ch), sess['hash']))
+        audit(con, ip, 'change code entered', f'{sess["email"]}: {describe(ch)}')
+    outbox('confirm', sess['email'], cid=ch['cid'], code=code)
+    return True, ('Sent to the server with your code. If it matches, the server makes the change and mails every '
+                  'admin (a reboot needs another admin too); if not, you get a mail and can enter it again. '
+                  'This page follows within a minute.')
 
 
 # ---------------------------------------------------------------- sessions
@@ -656,6 +667,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send(200, sources_page(sess))
             if route == '/advisories':
                 return self.send(200, advisories_page(sess))
+            if route == '/confirm':
+                row = con.execute('SELECT data FROM changes WHERE sess = ?', (sess['hash'],)).fetchone()
+                if row:
+                    return self.send(200, confirm_page(sess, describe(json.loads(row[0]))))
+                return self.send(200, advisories_page(sess, err='No change is waiting for a code.'))
             if route == '/audit':
                 rows = con.execute('SELECT at, ip, event, detail FROM audit ORDER BY at DESC LIMIT 200').fetchall()
                 body = '<div class="card"><table><tr><th>When</th><th>From</th><th>Event</th><th>Detail</th></tr>' + ''.join(

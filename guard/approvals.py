@@ -25,7 +25,7 @@ import time
 ACTIONS = ('fix', 'hold', 'reboot')
 CHANNELS = ('email', 'dashboard', 'console')
 TARGET = re.compile(r'[0-9a-f]{8}|now')
-LINE_RX = re.compile(r'^\s*(FIX|HOLD|REBOOT)\s+(hg-[a-z2-7]{26})(?![a-z2-7])', re.I)
+LINE_RX = re.compile(r'^\s*(FIX|HOLD|REBOOT)\s+(hg-[a-z2-7]{26})\s*\.?\s*$', re.I)     # the line alone
 TOKEN_RX = re.compile(r'hg-[a-z2-7]{26}(?![a-z2-7])', re.I)
 QUOTE_START = re.compile(r'^(>|on .{0,300}wrote:?$|-{2,}\s*original message|_{5,}|from:\s|sent from my\s|--$)', re.I)
 MSG_MAX = 256 * 1024          # a reply bigger than this is not read
@@ -206,7 +206,8 @@ def approve(hg, action, target, by, channel, tok=None):
 # ---------------------------------------------------------------- replies by mail
 def sender(msg, hg):
     froms = msg.get_all('From') or []
-    if len(froms) != 1:
+    raw = [v for k, v in msg.raw_items() if k.lower() == 'from']
+    if len(froms) != 1 or len(raw) != 1 or '=?' in str(raw[0]):     # no encoded words in an address
         return None
     addrs = email.utils.getaddresses([str(froms[0])])
     if len(addrs) != 1:
@@ -222,13 +223,21 @@ def authenticated(msg, addr, authserv):
     if not ars:
         return False, 'no Authentication-Results from the mail server'
     top = re.sub(r'\s+', ' ', str(ars[0])).strip()
-    serv = top.split(';', 1)[0].strip().split(' ')[0].lower()
+    top = re.sub(r'"(?:[^"\\]|\\.)*"', '""', top)              # quoted strings: a sender writes those
+    for _ in range(5):
+        top = re.sub(r'\([^()]*\)', ' ', top)                    # comments, nested ones too
+    parts = [p.strip() for p in top.split(';')]
+    serv = parts[0].split(' ')[0].lower()
     if serv != authserv.lower():
         return False, f'the mail server\'s result is from "{serv[:60]}", not {authserv}'
     dom = addr.rsplit('@', 1)[1]
-    for m in re.finditer(r'\bdmarc=([a-z]+)\b[^;]*?\bheader\.from=([^\s;]+)', top, re.I):
-        if m.group(1).lower() == 'pass' and m.group(2).strip('"').lower() == dom:
-            return True, ''
+    dmarc = [p for p in parts[1:] if re.match(r'dmarc\s*=', p, re.I)]
+    if len(dmarc) != 1:
+        return False, f'DMARC did not pass for {dom}'
+    m = re.match(r'dmarc\s*=\s*([a-z]+)\b(.*)$', dmarc[0], re.I)
+    frm = re.search(r'\bheader\.from\s*=\s*([^\s;]+)', m.group(2), re.I) if m else None
+    if m and m.group(1).lower() == 'pass' and frm and frm.group(1).lower() == dom:
+        return True, ''
     return False, f'DMARC did not pass for {dom}'
 
 
@@ -289,7 +298,7 @@ def _handle(hg, raw):
         record(hg, '-', '-', addr, 'email', 'refused: no action line first in the reply')
         hg.mail(category='Approval', level='info', to=[addr], subject='Your reply was not understood',
                 body='Nothing was done. Put one of the lines from host-guard\'s mail (for example FIX hg-...) as the '
-                'first line of your reply, above the quoted mail.')
+                'first line of your reply, on a line of its own, above the quoted mail.')
         return 'refused', 'no action line'
     verb, tok = cmd.group(1).lower(), cmd.group(2).lower()
     req = _find(hg, tok)
@@ -351,32 +360,49 @@ def poll(hg, imap=None):
     ctx = ssl.create_default_context(cafile=C['IMAP_CA'] or None)
     im = imap or imaplib.IMAP4_SSL(C['IMAP_HOST'], int(C['IMAP_PORT']), ssl_context=ctx, timeout=60)
     done = 0
+    st = hg.load('approvals.json')
+    mark = st.get('imap', {})
     try:
         im.login(user, pw)
         im.select('INBOX')
-        since = time.strftime('%d-%b-%Y', time.gmtime(time.time() - 2 * 86400))
-        typ, data = im.uid('SEARCH', None, 'UNSEEN', 'SINCE', since)
-        uids = (data[0] or b'').split()[-PER_RUN:] if typ == 'OK' else []
+        validity = (getattr(im, 'untagged_responses', {}).get('UIDVALIDITY') or [b''])[-1]
+        validity = validity.decode() if isinstance(validity, bytes) else str(validity)
+        last = int(mark.get('last', 0)) if mark.get('validity') == validity else 0
+        if last:                                     # everything after the last mail read, oldest first:
+            typ, data = im.uid('SEARCH', None, 'UID', f'{last + 1}:*')     # newer mail never hides a reply
+        else:
+            since = time.strftime('%d-%b-%Y', time.gmtime(time.time() - 2 * 86400))
+            typ, data = im.uid('SEARCH', None, 'SINCE', since)
+        uids = sorted((u for u in ((data[0] or b'').split() if typ == 'OK' else []) if int(u) > last), key=int)[:PER_RUN]
         for uid in uids:
-            typ, meta = im.uid('FETCH', uid, '(RFC822.SIZE)')
-            m = re.search(rb'RFC822\.SIZE (\d+)', b' '.join(x if isinstance(x, bytes) else b' '.join(x) for x in meta or []))
-            if not m or int(m.group(1)) > MSG_MAX:
-                continue
-            typ, parts = im.uid('FETCH', uid, '(BODY.PEEK[])')
-            raw = next((p[1] for p in parts or [] if isinstance(p, tuple) and len(p) > 1), b'')
-            if not TOKEN_RX.search(raw.decode('utf-8', 'replace')):
-                continue                                     # not a reply to host-guard: left as it was
-            verdict, detail = handle(hg, raw)
-            im.uid('STORE', uid, '+FLAGS', '(\\Seen)')
-            print(f'replies: {verdict}: {detail}')
-            done += 1
+            done += _one(hg, im, uid)
+            mark = {'validity': validity, 'last': int(uid)}  # only once that mail was read to the end
     finally:
         try:
             im.logout()
         except Exception:
             pass
+        st = hg.load('approvals.json')
+        st['imap'] = mark
+        hg.save(st, 'approvals.json')
     print(f'replies: {done} read')
     return 0
+
+
+def _one(hg, im, uid):
+    """Read one mail of the inbox; 1 when it was a reply to host-guard."""
+    typ, meta = im.uid('FETCH', uid, '(RFC822.SIZE)')
+    m = re.search(rb'RFC822\.SIZE (\d+)', b' '.join(x if isinstance(x, bytes) else b' '.join(x) for x in meta or []))
+    if not m or int(m.group(1)) > MSG_MAX:
+        return 0
+    typ, parts = im.uid('FETCH', uid, '(BODY.PEEK[])')
+    raw = next((p[1] for p in parts or [] if isinstance(p, tuple) and len(p) > 1), b'')
+    if not TOKEN_RX.search(raw.decode('utf-8', 'replace')):
+        return 0                                             # not a reply to host-guard: left as it was
+    verdict, detail = handle(hg, raw)
+    im.uid('STORE', uid, '+FLAGS', '(\\Seen)')
+    print(f'replies: {verdict}: {detail}')
+    return 1
 
 
 def lines(hg, n=30):
