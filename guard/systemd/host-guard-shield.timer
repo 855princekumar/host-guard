@@ -1,0 +1,11 @@
+[Unit]
+Description=host-guard: advisories (inventory against official sources; context from news and labs)
+
+[Timer]
+OnBootSec=20min
+OnUnitActiveSec=6h
+RandomizedDelaySec=20min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

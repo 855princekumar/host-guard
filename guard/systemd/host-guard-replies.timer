@@ -1,0 +1,10 @@
+[Unit]
+Description=host-guard: act on admins' replies (fix, hold, reboot; only when REPLY_ACTIONS=on)
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=2min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

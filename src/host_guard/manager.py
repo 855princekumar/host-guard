@@ -54,12 +54,13 @@ MAX_COPY = 8 * 1024 * 1024
 # Where install.sh, the base hardening, an app's own hardening and the panel write.
 WATCH_DIRS = ['/etc/ssh/sshd_config.d', '/etc/fail2ban/jail.d', '/etc/fail2ban/filter.d', '/etc/sysctl.d',
               '/etc/apt/apt.conf.d', '/etc/apt/sources.list.d', '/etc/apt/keyrings', '/etc/logrotate.d',
-              '/etc/systemd/system', '/usr/local/sbin', '/usr/local/lib/host-guard-panel', '/etc/host-guard-panel']
+              '/etc/systemd/system', '/usr/local/sbin', '/usr/local/lib/host-guard', '/usr/local/lib/host-guard-panel',
+              '/etc/host-guard-panel']
 WATCH_GLOBS = ['/etc/systemd/system/*.wants']
 WATCH_FILES = ['/etc/msmtprc', '/etc/docker/daemon.json']
 NOT_TRACKED = {WRAPPER}                       # the manager itself only ever moves forward
 DIRS = ['/etc/host-guard', '/var/lib/host-guard', '/var/backups/host-guard', '/var/lib/host-guard-panel',
-        '/var/lib/host-guard-export', '/etc/host-guard-panel', '/usr/local/lib/host-guard-panel']
+        '/var/lib/host-guard-export', '/etc/host-guard-panel', '/usr/local/lib/host-guard-panel', '/usr/local/lib/host-guard']
 USERS = ['hgpanel']
 # What install.sh asks apt for; uninstall --purge considers these and their automatic dependencies.
 KNOWN_PACKAGES = {'msmtp', 'msmtp-mta', 'unattended-upgrades', 'gnupg', 'lynis', 'curl', 'ca-certificates',
@@ -919,7 +920,8 @@ def purge(all_entries, delete_backups):
         if user_exists(u):
             run(['userdel', u], stderr=subprocess.DEVNULL)
     for d in sorted(dirs | {'/etc/host-guard', '/var/lib/host-guard', '/var/lib/host-guard-panel',
-                            '/var/lib/host-guard-export', '/etc/host-guard-panel', '/usr/local/lib/host-guard-panel'}):
+                            '/var/lib/host-guard-export', '/etc/host-guard-panel', '/usr/local/lib/host-guard-panel',
+                            '/usr/local/lib/host-guard'}):
         if d == '/var/backups/host-guard' and not delete_backups:
             continue
         shutil.rmtree(R(d), ignore_errors=True)

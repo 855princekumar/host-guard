@@ -11,6 +11,7 @@ PHASES = [('SSH', 'SSH: initial access'), ('WEB', 'Web: probing and flooding'),
           ('HOST', 'Host: persistence, privilege, miners'), ('NET', 'Network: egress and scanning'),
           ('BAK', 'Backups: confidentiality and integrity'), ('SEC', 'Secrets'), ('GUI', 'Panel in a real browser'),
           ('PANEL', 'Panel: web attacks (raw HTTP, a hostile page in the same browser, the root mailer)'),
+          ('MAIL', 'Approvals by mail reply (forged, replayed and quoted replies; a real IMAP server)'),
           ('PKG', 'The pip package (supply chain)')]
 ICON = {'PASS': 'stopped', 'GAP': 'gap', 'FAIL': '**FAILED**'}
 n = {k: sum(r['result'] == k for r in rows) for k in ('PASS', 'GAP', 'FAIL')}

@@ -1,0 +1,10 @@
+[Unit]
+Description=host-guard: act on admins' replies (fix, hold, reboot; only when REPLY_ACTIONS=on)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/hostguard replies
+Nice=5
+TimeoutStartSec=45min

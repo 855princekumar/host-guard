@@ -2,7 +2,13 @@
 
 One page with everything host-guard knows (health, intrusion watch, bans, backup,
 restore test, scan, early warning, open problems, recent mails), for the admins.
-Read-only in this version: changes are made on the server.
+Three changes can be made from it, each confirmed with a fresh code mailed to the admin and
+mailed to every admin when done:
+- [advisory sources](ADVISORIES.md#sources);
+- **Fix now** and **Hold** on a Critical or Moderate finding;
+- **Approve a reboot now** ([approvals](APPROVALS.md); a reboot needs two admins).
+
+Everything else is changed on the server.
 
 **No password.** An admin types their email address, gets a 6-digit code at that address,
 and signs in with it. The admins are the addresses host-guard already mails (`--mail-to` at
@@ -113,6 +119,28 @@ sequenceDiagram
     end
 ```
 
+## Advisories and approvals
+
+**Advisories and approvals** (`/advisories`) lists:
+- the open Critical and Moderate findings, with **Fix now** and **Hold** where an automatic
+  fix exists;
+- a pending reboot, with **Approve a reboot now**;
+- what waits for a second admin;
+- the **Approvals log**: who approved what, by email reply, on the dashboard or on the
+  server.
+
+A button never acts by itself:
+1. The panel only asks root.
+2. Root mails the admin a code. Root made the code, the panel never sees it, and it is bound
+   to that admin and exactly that change, which the mail names in root's own words (*Your code
+   to confirm a dashboard change*).
+3. The admin types it on the dashboard, and the panel passes it to root.
+4. Root makes the change only when the code matches: 5 tries, 10 changes an hour, and two
+   admins for a reboot.
+
+A stolen session cookie, or even a taken-over panel process, changes nothing without the
+admin's mailbox.
+
 ## Settings
 
 `/etc/host-guard-panel/panel.conf` (`KEY=value`; environment `HGP_<KEY>` wins):
@@ -134,7 +162,8 @@ Who the admins are is a host-guard setting, not a panel one: `PANEL_ADMINS` in
 
 ## Roadmap
 
-1. Read-only panel (this version).
+1. Read-only panel; advisory sources, fix, hold and reboot approvals with a fresh code
+   (this version).
 2. Settings from the panel (recipients, thresholds, schedule), with secrets
    write-only, through a root helper that accepts a fixed list of actions and
    checks every value.

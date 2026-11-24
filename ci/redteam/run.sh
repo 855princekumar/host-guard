@@ -17,6 +17,7 @@ PY="${PYTHON:-python3}"
 IMG=ubuntu:24.04
 FLOCI=floci/floci@sha256:a0fbf944d7f338cc0856f1ef83831ea749ff2be71956eb7a7fce08fc21458e19
 BROWSER=mcr.microsoft.com/playwright/python@sha256:640d578aae63cfb632461d1b0aecb01414e4e020864ac3dd45a868dc0eff3078   # v1.55.0-noble
+ZAPIMG=ghcr.io/zaproxy/zaproxy@sha256:7840969c7c9fead565bf9734b12f49f6886db90b1d35b1f74d79710bbd081dab   # 2.16.1, nightly only (ZAP=1)
 DIST="${DIST:-$REPO/dist}"     # the built wheel: the red team attacks exactly what would be published
 ls "$DIST"/host_guard-*.whl >/dev/null 2>&1 || { echo "no wheel in $DIST: python3 ci/build_dist.py first"; exit 1; }
 NET=hg-redteam
@@ -231,6 +232,18 @@ grep -q '"GUI-2"' "$OUT/browser.jsonl" || record GUI-0 T1078 "The browser stage 
 echo "==> Panel (raw HTTP through the tunnel)"
 T 'python3 /src/ci/redteam/panel_attack.py' > "$OUT/panel.jsonl" 2>"$OUT/panel.err"
 cat "$OUT/browser.jsonl" >> "$OUT/panel.jsonl"
+echo "==> Approvals by mail reply (a real IMAP server on the target)"
+T 'timeout 900 python3 /src/ci/redteam/approvals_attack.py' > "$OUT/approvals.jsonl" 2>"$OUT/approvals.err" || tail -5 "$OUT/approvals.err"
+grep -q '"MAIL-8"' "$OUT/approvals.jsonl" || record MAIL-X T1078 "The approvals stage ran" "it ran" FAIL "no approvals results: $(tail -1 "$OUT/approvals.err" | cut -c1-150)"
+cat "$OUT/approvals.jsonl" >> "$OUT/panel.jsonl"
+if [ "${ZAP:-0}" = 1 ]; then
+  echo "==> OWASP ZAP baseline of the panel (passive scan, through the tunnel's address)"
+  mkdir -p "$OUT/zap" && chmod 777 "$OUT/zap"
+  docker run --rm --network container:hgrt-target -v "$OUT/zap:/zap/wrk:rw" "$ZAPIMG"     zap-baseline.py -t http://127.0.0.1:8650/login -I -J zap.json -r zap.html > "$OUT/zap/zap.log" 2>&1
+  rc=$?
+  sum=$(grep -E '^(FAIL-NEW|WARN-NEW|PASS):' "$OUT/zap/zap.log" | tail -1)
+  record WEB-ZAP T1190 "OWASP ZAP baseline scan of the panel (passive rules: headers, cookies, leaks, injection signs)"     "no FAIL" "$(verdict "$([ "$rc" = 0 ] && echo 1)")" "exit $rc; ${sum:-$(tail -1 "$OUT/zap/zap.log" | cut -c1-150)}"
+fi
 "$PY" - "$(hp "$OUT/panel.jsonl")" "$(hp "$OUT/results.jsonl")" <<'PYEOF'
 import json, sys
 with open(sys.argv[2], 'a') as out:

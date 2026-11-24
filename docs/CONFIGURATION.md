@@ -24,6 +24,9 @@ Start from a profile in [examples/profiles/](../examples/profiles/) and change w
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | only for S3 backups without an instance role (also a Google Cloud HMAC key, an OCI customer secret key, R2, B2, ...) |
 | `BACKUP_REMOTE_URL` | `BACKUP_REMOTE=azure`: a container SAS URL; `oci-par`: a bucket pre-authenticated request URL ([clouds](CLOUDS.md)) |
 | `EDGESHELL_KEY` | only for EdgeShell: a read-only service key for fleet numbers in the report |
+| `IMAP_PASSWORD` | only for [approvals by reply](APPROVALS.md) with another mailbox than the sending one; empty: `SMTP_PASSWORD` |
+| `NVD_API_KEY` | optional: a higher NVD rate limit for the [advisories](ADVISORIES.md) |
+| `READER_KEY` | optional: the key of the web page reader (`READER`) |
 
 ## Mail
 
@@ -114,6 +117,35 @@ The command runs as root with `pipefail`: if it fails, the backup fails and you 
 | `KEV_URL` | CISA's Known Exploited Vulnerabilities feed |
 | `USN_URL` | Ubuntu security notices |
 | `OSV_URL`, `OSV_VULN_URL` | the OSV advisory database |
+
+## Advisories
+
+[ADVISORIES.md](ADVISORIES.md): every 6 hours, the server's software against official sources.
+
+| Key | Default | What |
+|---|---|---|
+| `AUTO_FIX` | `off` | `critical`: fix Critical findings by themselves after the hold; `off`: only an admin fixes |
+| `AUTO_FIX_HOLD_H` | `24` | hours the admins have to hold a Critical fix before it runs |
+| `FIX_WINDOW` | empty | when automatic fixes may run, e.g. `Sun 03:30-05:00`; empty: any time after the hold |
+| `READER` | empty | a reader for context web pages, e.g. `https://r.jina.ai/` (Markdown back); empty: read directly. Never used for official sources |
+| `SOURCES_MAX` | `20` | sources the admins may add |
+| `NVD_URL`, `EPSS_URL`, `EOL_URL` | the public APIs | NVD, FIRST EPSS, endoflife.date |
+| `SHIELD_PATH` | `/usr/local/lib/host-guard/shield.py` | where the advisories (and `approvals.py`, next to it) are installed |
+
+## Approvals
+
+[APPROVALS.md](APPROVALS.md): fix, hold and reboot approved by reply, on the dashboard or on the server.
+
+| Key | Default | What |
+|---|---|---|
+| `REPLY_ACTIONS` | `off` | `on`: host-guard's mails carry reply lines, and replies are read every 2 minutes |
+| `IMAP_HOST`, `IMAP_PORT` | `imap.gmail.com`, `993` | the inbox replies arrive in (TLS only) |
+| `IMAP_USER` | `MAIL_FROM` | its user |
+| `IMAP_CA` | empty | a CA file for a mail server with its own certificate |
+| `REPLY_AUTHSERV` | `mx.google.com` | the name the inbox's own mail server writes first in `Authentication-Results`; only its DMARC verdict counts |
+| `REPLY_TTL_H` | `24` | hours a reply code works |
+| `REBOOT_APPROVALS` | `2` | different admins needed for a reboot (never more than there are) |
+| `FIX_APPROVALS` | `1` | different admins needed for a fix now |
 
 ## Where it runs
 

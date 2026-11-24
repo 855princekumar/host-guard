@@ -25,7 +25,7 @@ snap() {   # every place host-guard may touch: path, type, hash or link target, 
   python3 - "$1" <<'PY'
 import hashlib, os, stat, sys
 places = ['/etc/ssh/sshd_config.d', '/etc/fail2ban', '/etc/sysctl.d', '/etc/apt/apt.conf.d', '/etc/apt/sources.list.d',
-          '/etc/apt/keyrings', '/etc/logrotate.d', '/etc/systemd/system', '/usr/local/sbin', '/usr/local/lib/host-guard-panel',
+          '/etc/apt/keyrings', '/etc/logrotate.d', '/etc/systemd/system', '/usr/local/sbin', '/usr/local/lib/host-guard', '/usr/local/lib/host-guard-panel',
           '/etc/host-guard-panel', '/etc/host-guard', '/var/lib/host-guard', '/var/lib/host-guard-panel',
           '/var/lib/host-guard-export', '/var/backups/host-guard', '/opt/host-guard', '/etc/msmtprc', '/etc/docker']
 rows = []
